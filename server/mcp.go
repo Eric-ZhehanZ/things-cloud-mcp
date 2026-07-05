@@ -622,6 +622,17 @@ func mcpTrashTask(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 	return writeResult(map[string]string{"status": "trashed", "uuid": uuid}), nil
 }
 
+func mcpPurgeTask(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	uuid, err := req.RequireString("uuid")
+	if err != nil {
+		return mcp.NewToolResultError("uuid is required"), nil
+	}
+	if err := purgeTask(uuid); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return writeResult(map[string]string{"status": "purged", "uuid": uuid}), nil
+}
+
 func mcpMoveToToday(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	uuid, err := req.RequireString("uuid")
 	if err != nil {
@@ -1368,6 +1379,15 @@ func newMCPHandler() http.Handler {
 			mcp.Description("UUID of the task to trash"),
 		),
 	), mcpTrashTask)
+
+	s.AddTool(mcp.NewTool("things_purge_task",
+		mcp.WithDescription("PERMANENTLY delete a Things task. This cannot be undone — the task is erased from all synced devices, not moved to trash. Prefer things_trash_task (reversible) unless the user explicitly asks for permanent deletion."),
+		mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithString("uuid",
+			mcp.Required(),
+			mcp.Description("UUID of the task to permanently delete"),
+		),
+	), mcpPurgeTask)
 
 	s.AddTool(mcp.NewTool("things_move_to_today",
 		mcp.WithDescription("Move a Things task to the Today view"),

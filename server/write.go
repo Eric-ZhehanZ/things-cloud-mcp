@@ -1220,6 +1220,28 @@ func untrashTask(uuid string) error {
 	return nil
 }
 
+// purgeTask permanently deletes a task via Tombstone2. Unlike trash, this
+// cannot be undone — the event removes the task from every synced device.
+func purgeTask(uuid string) error {
+	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
+		return err
+	}
+	tombUUID := generateUUID()
+	payload := map[string]any{
+		"dloid": uuid,
+		"dld":   nowTs(),
+	}
+	env := writeEnvelope{id: tombUUID, action: 0, kind: "Tombstone2", payload: payload}
+	if err := writeToHistory(env); err != nil {
+		return err
+	}
+	syncAfterWrite()
+	return nil
+}
+
 func createArea(title string, tagUUIDs []string) (string, error) {
 	areaUUID := generateUUID()
 	validatedTags, err := validateUUIDSlice("tags", tagUUIDs)
