@@ -1026,7 +1026,7 @@ func countStatus(checks []smokeCheck, status string) int {
 const (
 	mcpServerName    = "Things Cloud"
 	mcpServerTitle   = "Things Cloud (Things 3)"
-	mcpServerVersion = "1.2.0"
+	mcpServerVersion = "1.3.0"
 )
 
 const mcpServerInstructions = `Read/write access to a Things 3 account via Things Cloud sync.
@@ -1035,7 +1035,10 @@ Conventions:
 - Entities are referenced by Things Base58 UUIDs. Get UUIDs from the list, search, and get tools — never invent them. Writes are rejected when the target UUID does not exist in synced state.
 - 'when' controls scheduling (today, anytime, someday, inbox, or YYYY-MM-DD; a future date lands in Upcoming). 'deadline' is a hard due date — only set it when the user explicitly asks for one.
 - Checklist items are lightweight checkboxes inside a task. Subtasks are full tasks created via things_create_task with parent_task.
-- Trashing a task is reversible (things_untrash_task). Deleting a checklist item is permanent.
+- 'reminder' ("HH:MM", 24h) sets a notification time and needs a dated 'when' (today or YYYY-MM-DD); dropping the date drops the reminder.
+- Headings live inside projects; assign tasks to one via the 'heading' parameter on create/edit.
+- Trashing a task is reversible (things_untrash_task). Purging a task and deleting a checklist item are PERMANENT — prefer trash unless the user explicitly wants permanent deletion.
+- things_cancel_task logs a task as "won't do"; things_uncomplete_task reopens completed or canceled tasks.
 - things_smoke_test writes to the real account (it creates, edits, completes, and trashes a "[smoke-test]" task); run it only as a diagnostic.
 - Reads sync from Things Cloud on demand, throttled to at most one sync every few seconds; reads immediately after a write are already fresh.`
 
