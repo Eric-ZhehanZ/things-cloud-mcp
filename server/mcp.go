@@ -39,6 +39,7 @@ type taskOutput struct {
 	Deadline      string   `json:"deadline,omitempty"`
 	ScheduledFor  string   `json:"scheduled_for,omitempty"`
 	Reminder      string   `json:"reminder,omitempty"`
+	Repeat        string   `json:"repeat,omitempty"`
 	TodayIndexRef string   `json:"today_index_ref,omitempty"`
 	ProjectID     string   `json:"project_id,omitempty"`
 	AreaID        string   `json:"area_id,omitempty"`
@@ -101,6 +102,7 @@ func formatTask(t *things.Task) taskOutput {
 	if t.AlarmTimeOffset != nil {
 		o.Reminder = fmt.Sprintf("%02d:%02d", *t.AlarmTimeOffset/3600, (*t.AlarmTimeOffset%3600)/60)
 	}
+	o.Repeat = describeRepeat(t.Repeater)
 	if t.TodayIndexReference != nil {
 		o.TodayIndexRef = t.TodayIndexReference.Format("2006-01-02")
 	}
@@ -111,6 +113,36 @@ func formatTask(t *things.Task) taskOutput {
 		o.AreaID = t.AreaIDs[0]
 	}
 	return o
+}
+
+// describeRepeat renders a repeat rule as a short human-readable phrase,
+// e.g. "every 2 weeks until 2027-03-01" or "every month after completion".
+func describeRepeat(rc *things.RepeaterConfiguration) string {
+	if rc == nil {
+		return ""
+	}
+	unit := "period"
+	switch rc.FrequencyUnit {
+	case things.FrequencyUnitDaily:
+		unit = "day"
+	case things.FrequencyUnitWeekly:
+		unit = "week"
+	case things.FrequencyUnitMonthly:
+		unit = "month"
+	case things.FrequencyUnitYearly:
+		unit = "year"
+	}
+	desc := "every " + unit
+	if rc.FrequencyAmplitude > 1 {
+		desc = fmt.Sprintf("every %d %ss", rc.FrequencyAmplitude, unit)
+	}
+	if rc.Type == 1 {
+		desc += " after completion"
+	}
+	if rc.LastScheduledAt != nil && !rc.IsNeverending() {
+		desc += " until " + rc.LastScheduledAt.Time().Format("2006-01-02")
+	}
+	return desc
 }
 
 func jsonToolResult(v any) *mcp.CallToolResult {
