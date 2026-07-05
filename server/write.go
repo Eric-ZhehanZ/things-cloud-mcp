@@ -8,6 +8,8 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	gosync "sync"
 	"time"
@@ -201,22 +203,153 @@ func generateUUID() string {
 	return string(encoded)
 }
 
-// syncForRead syncs before a read operation, logging any errors.
+const defaultSyncMinInterval = 2 * time.Second
+
+var (
+	// syncThrottleMu single-flights syncs against Things Cloud and guards
+	// lastSyncAt, so bursts of tool calls don't trip their rate limiting.
+	syncThrottleMu gosync.Mutex
+	lastSyncAt     time.Time
+
+	// doSync performs one sync against Things Cloud. Overridable in tests.
+	doSync = func() error {
+		_, err := syncer.Sync()
+		return err
+	}
+)
+
+// syncMinInterval reads SYNC_MIN_INTERVAL (whole seconds) on each call so
+// tests can vary it; invalid or unset values fall back to the default.
+func syncMinInterval() time.Duration {
+	raw := os.Getenv("SYNC_MIN_INTERVAL")
+	if raw == "" {
+		return defaultSyncMinInterval
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return defaultSyncMinInterval
+	}
+	return time.Duration(n) * time.Second
+}
+
+// syncForRead refreshes local state before a read, skipping the round trip
+// to Things Cloud when the last successful sync is recent enough.
 // Returns the error so callers can optionally surface it.
 func syncForRead() error {
-	if _, err := syncer.Sync(); err != nil {
+	syncThrottleMu.Lock()
+	defer syncThrottleMu.Unlock()
+	if time.Since(lastSyncAt) < syncMinInterval() {
+		return nil
+	}
+	if err := doSync(); err != nil {
 		log.Printf("[SYNC] pre-read sync failed: %v", err)
 		return err
+	}
+	lastSyncAt = time.Now()
+	return nil
+}
+
+// syncAfterWrite syncs after a write to refresh local state. It bypasses the
+// throttle so the write is immediately visible to reads.
+// Errors are logged but not returned (best-effort refresh).
+func syncAfterWrite() {
+	syncThrottleMu.Lock()
+	defer syncThrottleMu.Unlock()
+	if err := doSync(); err != nil {
+		log.Printf("[SYNC] post-write refresh failed: %v", err)
+		return
+	}
+	lastSyncAt = time.Now()
+}
+
+// ---------------------------------------------------------------------------
+// Existence validation
+//
+// UUID arguments are format-checked by validateUUID, but a well-formed UUID
+// can still point at nothing. Writing an update for a nonexistent entity
+// appends a permanent orphan event to the Things Cloud history and reports
+// false success, so every write verifies its targets against synced local
+// state first.
+// ---------------------------------------------------------------------------
+
+// entityStore is the subset of *sync.State used for existence checks.
+type entityStore interface {
+	Task(uuid string) (*thingscloud.Task, error)
+	Area(uuid string) (*thingscloud.Area, error)
+	Tag(uuid string) (*thingscloud.Tag, error)
+	ChecklistItem(uuid string) (*thingscloud.CheckListItem, error)
+}
+
+// validationState returns entity lookups backed by local state, refreshed
+// best-effort (stale state still validates better than none). Overridable
+// in tests.
+var validationState = func() entityStore {
+	_ = syncForRead()
+	return syncer.State()
+}
+
+func requireTask(st entityStore, name, uuid string) (*thingscloud.Task, error) {
+	task, err := st.Task(uuid)
+	if err != nil {
+		return nil, fmt.Errorf("%s lookup failed: %w", name, err)
+	}
+	if task == nil {
+		return nil, invalidInputf("%s not found in synced state: %s", name, uuid)
+	}
+	return task, nil
+}
+
+func requireProject(st entityStore, name, uuid string) error {
+	task, err := requireTask(st, name, uuid)
+	if err != nil {
+		return err
+	}
+	if task.Type != thingscloud.TaskTypeProject {
+		return invalidInputf("%s is not a project: %s", name, uuid)
 	}
 	return nil
 }
 
-// syncAfterWrite syncs after a write to refresh local state.
-// Errors are logged but not returned (best-effort refresh).
-func syncAfterWrite() {
-	if _, err := syncer.Sync(); err != nil {
-		log.Printf("[SYNC] post-write refresh failed: %v", err)
+func requireArea(st entityStore, name, uuid string) error {
+	area, err := st.Area(uuid)
+	if err != nil {
+		return fmt.Errorf("%s lookup failed: %w", name, err)
 	}
+	if area == nil {
+		return invalidInputf("%s not found in synced state: %s", name, uuid)
+	}
+	return nil
+}
+
+func requireTag(st entityStore, name, uuid string) error {
+	tag, err := st.Tag(uuid)
+	if err != nil {
+		return fmt.Errorf("%s lookup failed: %w", name, err)
+	}
+	if tag == nil {
+		return invalidInputf("%s not found in synced state: %s", name, uuid)
+	}
+	return nil
+}
+
+func requireTags(st entityStore, name string, uuids []string) error {
+	for _, id := range uuids {
+		if err := requireTag(st, name, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func requireChecklistItem(st entityStore, uuid string) error {
+	item, err := st.ChecklistItem(uuid)
+	if err != nil {
+		return fmt.Errorf("checklist item lookup failed: %w", err)
+	}
+	if item == nil {
+		return invalidInputf("checklist item not found in synced state: %s", uuid)
+	}
+	return nil
 }
 
 func nowTs() float64 {
@@ -562,6 +695,21 @@ func createTask(req CreateTaskRequest) (string, error) {
 		return "", err
 	}
 
+	state := validationState()
+	if req.Project != "" {
+		if err := requireProject(state, "project", req.Project); err != nil {
+			return "", err
+		}
+	}
+	if req.ParentTask != "" {
+		if _, err := requireTask(state, "parent_task", req.ParentTask); err != nil {
+			return "", err
+		}
+	}
+	if err := requireTags(state, "tags", tg); err != nil {
+		return "", err
+	}
+
 	taskUUID := generateUUID()
 	now := nowTs()
 
@@ -651,6 +799,9 @@ func completeTask(uuid string) error {
 	if err := validateUUID("uuid", uuid); err != nil {
 		return err
 	}
+	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
+		return err
+	}
 	ts := nowTs()
 	u := newTaskUpdate().status(3).stopDate(ts)
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
@@ -663,6 +814,9 @@ func completeTask(uuid string) error {
 
 func trashTask(uuid string) error {
 	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
 		return err
 	}
 	u := newTaskUpdate().trash(true)
@@ -692,9 +846,48 @@ func editTask(req EditTaskRequest) error {
 		return err
 	}
 
+	st := validationState()
+	task, err := requireTask(st, "uuid", req.UUID)
+	if err != nil {
+		return err
+	}
+	if req.Project != "" && req.Project != "none" {
+		if err := requireProject(st, "project", req.Project); err != nil {
+			return err
+		}
+	}
+	if req.ParentTask != "" && req.ParentTask != "none" {
+		if _, err := requireTask(st, "parent_task", req.ParentTask); err != nil {
+			return err
+		}
+	}
+	if req.Area != "" && req.Area != "none" {
+		if err := requireArea(st, "area", req.Area); err != nil {
+			return err
+		}
+	}
+	if err := requireTags(st, "tags", tags); err != nil {
+		return err
+	}
+
+	fields, err := buildEditUpdate(req, task)
+	if err != nil {
+		return err
+	}
+	env := writeEnvelope{id: req.UUID, action: 1, kind: "Task6", payload: fields}
+	if err := historyWrite(env); err != nil {
+		return err
+	}
+	syncAfterWrite()
+	return nil
+}
+
+// buildEditUpdate constructs the update payload for an edit. task is the
+// task's current synced state; inputs must already be format-validated.
+func buildEditUpdate(req EditTaskRequest, task *thingscloud.Task) (map[string]any, error) {
 	u := newTaskUpdate()
 	if req.Repeat != "" && req.When == "inbox" {
-		return invalidInputf("repeat tasks cannot be in inbox; use when:anytime, today, someday, YYYY-MM-DD, or omit when")
+		return nil, invalidInputf("repeat tasks cannot be in inbox; use when:anytime, today, someday, YYYY-MM-DD, or omit when")
 	}
 
 	if req.Title != "" {
@@ -711,7 +904,7 @@ func editTask(req EditTaskRequest) error {
 	} else if req.When != "" {
 		st, sr, tir, ok := parseWhen(req.When)
 		if !ok {
-			return invalidInputf("invalid when value: %s (use today, anytime, someday, inbox, none, or YYYY-MM-DD)", req.When)
+			return nil, invalidInputf("invalid when value: %s (use today, anytime, someday, inbox, none, or YYYY-MM-DD)", req.When)
 		}
 		u.schedule(st, sr, tir)
 	}
@@ -720,22 +913,34 @@ func editTask(req EditTaskRequest) error {
 	} else if req.Deadline != "" {
 		t, err := time.Parse("2006-01-02", req.Deadline)
 		if err != nil {
-			return invalidInputf("deadline must be YYYY-MM-DD format, got: %s", req.Deadline)
+			return nil, invalidInputf("deadline must be YYYY-MM-DD format, got: %s", req.Deadline)
 		}
 		if t.Unix() < todayMidnightUTC() {
-			return invalidInputf("deadline cannot be in the past")
+			return nil, invalidInputf("deadline cannot be in the past")
 		}
 		u.deadline(t.Unix())
 	}
-	if req.ParentTask != "" {
+	assigningParent := req.ParentTask != "" && req.ParentTask != "none"
+	assigningProject := req.Project != "" && req.Project != "none"
+	switch {
+	case req.ParentTask == "none" || (req.Project == "none" && req.ParentTask == ""):
+		u.fields["pr"] = []string{}
+	case assigningParent:
 		u.project(req.ParentTask)
-	} else if req.Project != "" {
+	case assigningProject:
 		u.project(req.Project)
-		if req.When == "" {
-			u.schedule(1, nil, nil)
-		}
+	}
+	// Moving into a project/parent only forces a reschedule when the task is
+	// leaving the inbox (inbox tasks can't live in projects); a task that
+	// already has a date keeps it.
+	if (assigningParent || assigningProject) && req.When == "" && task.Schedule == thingscloud.TaskScheduleInbox {
+		u.schedule(1, nil, nil)
 	}
 	if req.Tags != "" {
+		tags, err := parseUUIDList("tags", req.Tags)
+		if err != nil {
+			return nil, err
+		}
 		u.tags(tags)
 	}
 	if req.Area == "none" {
@@ -746,33 +951,26 @@ func editTask(req EditTaskRequest) error {
 	if req.Repeat == "none" {
 		u.fields["rr"] = nil
 	} else if req.Repeat != "" {
-		// If no new "when" is provided and the current task lives in Inbox, move it to Anytime.
-		// This avoids an inconsistent repeat+inbox combination in Things.
-		if req.When == "" {
-			if err := syncForRead(); err == nil {
-				if task, tErr := syncer.State().Task(req.UUID); tErr == nil && task != nil && task.Schedule == thingscloud.TaskScheduleInbox {
-					u.schedule(1, nil, nil)
-				}
-			}
+		// If no new "when" is provided and the task lives in Inbox, move it to
+		// Anytime to avoid an inconsistent repeat+inbox combination in Things.
+		if req.When == "" && task.Schedule == thingscloud.TaskScheduleInbox {
+			u.schedule(1, nil, nil)
 		}
 
-		refDate := time.Now()
-		rr, err := buildRepeatRule(req.Repeat, refDate)
+		rr, err := buildRepeatRule(req.Repeat, time.Now())
 		if err != nil {
-			return fmt.Errorf("invalid repeat: %w", err)
+			return nil, fmt.Errorf("invalid repeat: %w", err)
 		}
 		u.fields["rr"] = rr
 	}
-	env := writeEnvelope{id: req.UUID, action: 1, kind: "Task6", payload: u.build()}
-	if err := historyWrite(env); err != nil {
-		return err
-	}
-	syncAfterWrite()
-	return nil
+	return u.build(), nil
 }
 
 func moveTaskToToday(uuid string) error {
 	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
 		return err
 	}
 	today := todayMidnightUTC()
@@ -789,6 +987,9 @@ func moveTaskToAnytime(uuid string) error {
 	if err := validateUUID("uuid", uuid); err != nil {
 		return err
 	}
+	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
+		return err
+	}
 	u := newTaskUpdate().schedule(1, nil, nil)
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
 	if err := historyWrite(env); err != nil {
@@ -800,6 +1001,9 @@ func moveTaskToAnytime(uuid string) error {
 
 func moveTaskToSomeday(uuid string) error {
 	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
 		return err
 	}
 	u := newTaskUpdate().schedule(2, nil, nil)
@@ -815,6 +1019,9 @@ func moveTaskToInbox(uuid string) error {
 	if err := validateUUID("uuid", uuid); err != nil {
 		return err
 	}
+	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
+		return err
+	}
 	u := newTaskUpdate().schedule(0, nil, nil)
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
 	if err := historyWrite(env); err != nil {
@@ -826,6 +1033,9 @@ func moveTaskToInbox(uuid string) error {
 
 func uncompleteTask(uuid string) error {
 	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
 		return err
 	}
 	u := newTaskUpdate().status(0)
@@ -842,6 +1052,9 @@ func untrashTask(uuid string) error {
 	if err := validateUUID("uuid", uuid); err != nil {
 		return err
 	}
+	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
+		return err
+	}
 	u := newTaskUpdate().trash(false)
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
 	if err := historyWrite(env); err != nil {
@@ -855,6 +1068,9 @@ func createArea(title string, tagUUIDs []string) (string, error) {
 	areaUUID := generateUUID()
 	validatedTags, err := validateUUIDSlice("tags", tagUUIDs)
 	if err != nil {
+		return "", err
+	}
+	if err := requireTags(validationState(), "tags", validatedTags); err != nil {
 		return "", err
 	}
 	payload := map[string]any{
@@ -874,6 +1090,11 @@ func createArea(title string, tagUUIDs []string) (string, error) {
 func createTag(title, shorthand, parentUUID string) (string, error) {
 	if err := validateOptionalUUID("parent", parentUUID); err != nil {
 		return "", err
+	}
+	if parentUUID != "" && parentUUID != "none" {
+		if err := requireTag(validationState(), "parent", parentUUID); err != nil {
+			return "", err
+		}
 	}
 	tagUUID := generateUUID()
 	pn := []string{}
@@ -902,6 +1123,11 @@ func createTag(title, shorthand, parentUUID string) (string, error) {
 func createHeading(title, projectUUID string) (string, error) {
 	if err := validateOptionalUUID("project", projectUUID); err != nil {
 		return "", err
+	}
+	if projectUUID != "" && projectUUID != "none" {
+		if err := requireProject(validationState(), "project", projectUUID); err != nil {
+			return "", err
+		}
 	}
 	headingUUID := generateUUID()
 	now := nowTs()
@@ -932,6 +1158,11 @@ func createHeading(title, projectUUID string) (string, error) {
 func createProject(title, note, when, deadline, areaUUID string) (string, error) {
 	if err := validateOptionalUUID("area", areaUUID); err != nil {
 		return "", err
+	}
+	if areaUUID != "" && areaUUID != "none" {
+		if err := requireArea(validationState(), "area", areaUUID); err != nil {
+			return "", err
+		}
 	}
 	projectUUID := generateUUID()
 	now := nowTs()
@@ -1002,6 +1233,13 @@ func createChecklistItem(title, taskUUID string) (string, error) {
 	if err := validateUUID("task_uuid", taskUUID); err != nil {
 		return "", err
 	}
+	task, err := requireTask(validationState(), "task_uuid", taskUUID)
+	if err != nil {
+		return "", err
+	}
+	if task.Type != thingscloud.TaskTypeTask {
+		return "", invalidInputf("checklist items can only be added to tasks, not projects or headings: %s", taskUUID)
+	}
 	itemUUID := generateUUID()
 	now := nowTs()
 	payload := map[string]any{
@@ -1027,6 +1265,9 @@ func completeChecklistItem(uuid string) error {
 	if err := validateUUID("uuid", uuid); err != nil {
 		return err
 	}
+	if err := requireChecklistItem(validationState(), uuid); err != nil {
+		return err
+	}
 	ts := nowTs()
 	payload := map[string]any{
 		"md": ts,
@@ -1045,6 +1286,9 @@ func uncompleteChecklistItem(uuid string) error {
 	if err := validateUUID("uuid", uuid); err != nil {
 		return err
 	}
+	if err := requireChecklistItem(validationState(), uuid); err != nil {
+		return err
+	}
 	payload := map[string]any{
 		"md": nowTs(),
 		"ss": 0,
@@ -1060,6 +1304,9 @@ func uncompleteChecklistItem(uuid string) error {
 
 func deleteChecklistItem(uuid string) error {
 	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if err := requireChecklistItem(validationState(), uuid); err != nil {
 		return err
 	}
 	// Delete via Tombstone2
