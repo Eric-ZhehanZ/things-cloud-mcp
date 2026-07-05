@@ -301,6 +301,25 @@ func authHandlerMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// mcpAuthMiddleware protects the MCP endpoint with API_KEY when it is set.
+// The key is accepted either as "Authorization: Bearer <key>" (Claude Code,
+// Claude Desktop, mcp-remote) or as a "key" query parameter in the endpoint
+// URL, because claude.ai custom connectors cannot send custom headers.
+func mcpAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiKey := os.Getenv("API_KEY")
+		if apiKey == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") == "Bearer "+apiKey || r.URL.Query().Get("key") == apiKey {
+			next.ServeHTTP(w, r)
+			return
+		}
+		jsonError(w, "unauthorized", 401)
+	})
+}
+
 func debugAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if os.Getenv("DEBUG") != "true" {
@@ -556,8 +575,8 @@ func main() {
 		})
 	}))
 
-	// MCP endpoint (no bearer auth — claude.ai connectors use OAuth which we don't implement)
-	http.Handle("/mcp", newMCPHandler())
+	// MCP endpoint — protected by API_KEY when set (bearer header or ?key= query param)
+	http.Handle("/mcp", mcpAuthMiddleware(newMCPHandler()))
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

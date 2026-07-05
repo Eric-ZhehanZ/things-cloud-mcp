@@ -173,7 +173,7 @@ See **[docs/skills.md](docs/skills.md)** for a step-by-step guide to creating yo
 
 ## REST API
 
-All `/api/*` endpoints require `Authorization: Bearer <API_KEY>` when `API_KEY` is set.
+All `/api/*` endpoints require `Authorization: Bearer <API_KEY>` when `API_KEY` is set. The same key also protects the MCP endpoint (`/mcp`), which additionally accepts it as a `?key=<API_KEY>` query parameter for clients that can't send custom headers (e.g. claude.ai custom connectors). If `API_KEY` is unset, both surfaces are open — see [docs/installation.md](docs/installation.md) for setup.
 
 See **[docs/endpoints-and-things-cloud.md](docs/endpoints-and-things-cloud.md)** for how the REST and MCP surfaces sync from Things Cloud history, answer reads from the local SQLite mirror, and commit writes back to the cloud.
 
@@ -215,6 +215,12 @@ The underlying Go SDK can be used directly as a library. See **[docs/sdk.md](doc
 ./tests/test-mcp-read.sh       # All MCP read tools (29 checks)
 ./tests/test-mcp-protocol.sh   # JSON-RPC handshake and error handling (11 checks)
 API_KEY=your-key ./tests/test-api.sh  # All REST endpoints (18 checks)
+```
+
+The MCP test scripts also honor `API_KEY` — set it when the target server was deployed with one:
+
+```bash
+API_KEY=your-key ./tests/test-smoke.sh
 ```
 
 ## Local development

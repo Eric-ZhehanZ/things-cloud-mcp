@@ -98,6 +98,6 @@ See `docs/client-side-bugs.md` for the full investigation.
 The example app and real usage require:
 - `THINGS_USERNAME` — Things account email
 - `THINGS_PASSWORD` — Things account password
-- `API_KEY` — Bearer token for `/api/*` endpoints (optional, no auth if unset)
+- `API_KEY` — Auth token for `/api/*` (bearer header) and `/mcp` (bearer header or `?key=` query param); optional, no auth if unset
 - `PORT` — Server port (default: `8080`)
 - `DEBUG` — Enable verbose HTTP request/response logging when `true`
