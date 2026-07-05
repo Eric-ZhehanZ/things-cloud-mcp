@@ -38,6 +38,7 @@ type taskOutput struct {
 	CompletedAt   string   `json:"completed_at,omitempty"`
 	Deadline      string   `json:"deadline,omitempty"`
 	ScheduledFor  string   `json:"scheduled_for,omitempty"`
+	Reminder      string   `json:"reminder,omitempty"`
 	TodayIndexRef string   `json:"today_index_ref,omitempty"`
 	ProjectID     string   `json:"project_id,omitempty"`
 	AreaID        string   `json:"area_id,omitempty"`
@@ -96,6 +97,9 @@ func formatTask(t *things.Task) taskOutput {
 	}
 	if t.ScheduledDate != nil {
 		o.ScheduledFor = t.ScheduledDate.Format("2006-01-02")
+	}
+	if t.AlarmTimeOffset != nil {
+		o.Reminder = fmt.Sprintf("%02d:%02d", *t.AlarmTimeOffset/3600, (*t.AlarmTimeOffset%3600)/60)
 	}
 	if t.TodayIndexReference != nil {
 		o.TodayIndexRef = t.TodayIndexReference.Format("2006-01-02")
@@ -494,6 +498,7 @@ func mcpCreateTask(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolRes
 		ParentTask: req.GetString("parent_task", ""),
 		Tags:       req.GetString("tags", ""),
 		Repeat:     req.GetString("repeat", ""),
+		Reminder:   req.GetString("reminder", ""),
 	})
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -528,6 +533,7 @@ func mcpEditTask(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResul
 		Area:       req.GetString("area", ""),
 		Tags:       req.GetString("tags", ""),
 		Repeat:     req.GetString("repeat", ""),
+		Reminder:   req.GetString("reminder", ""),
 	}); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -1160,6 +1166,9 @@ func newMCPHandler() http.Handler {
 		mcp.WithString("repeat",
 			mcp.Description("Recurrence rule. Accepts: 'daily', 'weekly', 'monthly', 'yearly', or 'every N days/weeks/months/years'. Append 'until YYYY-MM-DD' for an inclusive end date and/or 'after completion' for repeat-after-completion mode (e.g. 'daily until 2026-02-24 after completion'). Weekly defaults to the current weekday, monthly to the current day of month. Repeating tasks cannot be created in inbox."),
 		),
+		mcp.WithString("reminder",
+			mcp.Description("Reminder time in 24h HH:MM format (e.g. '17:00'). Requires a dated 'when' (today or YYYY-MM-DD); Things fires the notification at this time on the scheduled day."),
+		),
 	), mcpCreateTask)
 
 	s.AddTool(mcp.NewTool("things_complete_task",
@@ -1202,6 +1211,9 @@ func newMCPHandler() http.Handler {
 		),
 		mcp.WithString("repeat",
 			mcp.Description("Recurrence rule. Accepts: 'daily', 'weekly', 'monthly', 'yearly', 'every N days/weeks/months/years', or 'none' to clear. Append 'until YYYY-MM-DD' for an inclusive end date and/or 'after completion' for repeat-after-completion mode. Repeating tasks cannot be moved to inbox."),
+		),
+		mcp.WithString("reminder",
+			mcp.Description("Reminder time in 24h HH:MM format (e.g. '17:00'), or 'none' to remove it. The task must keep a dated 'when' (today or YYYY-MM-DD); removing the date also removes the reminder."),
 		),
 	), mcpEditTask)
 
