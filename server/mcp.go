@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +16,14 @@ import (
 	things "github.com/arthursoares/things-cloud-sdk"
 	"github.com/arthursoares/things-cloud-sdk/sync"
 )
+
+// Things app icon, downscaled from things-logo-rich.png at the repo root.
+// Served as a data URI in the MCP initialize response.
+//
+//go:embed things_icon.png
+var thingsIconPNG []byte
+
+var thingsIconDataURI = "data:image/png;base64," + base64.StdEncoding.EncodeToString(thingsIconPNG)
 
 // ---------------------------------------------------------------------------
 // Output types for JSON serialization
@@ -903,9 +913,14 @@ Conventions:
 func newMCPHandler() http.Handler {
 	hooks := &server.Hooks{}
 	// mcp-go's initialize response only carries name and version; fill in the
-	// display title here.
+	// display title and icon here.
 	hooks.AddAfterInitialize(func(_ context.Context, _ any, _ *mcp.InitializeRequest, result *mcp.InitializeResult) {
 		result.ServerInfo.Title = mcpServerTitle
+		result.ServerInfo.Icons = []mcp.Icon{{
+			Src:      thingsIconDataURI,
+			MIMEType: "image/png",
+			Sizes:    []string{"128x128"},
+		}}
 	})
 
 	s := server.NewMCPServer(mcpServerName, mcpServerVersion,

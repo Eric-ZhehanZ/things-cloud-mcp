@@ -149,6 +149,16 @@ func validateOptionalUUID(name, id string) error {
 	return validateUUID(name, id)
 }
 
+// normalizeOptionalUUID maps the "none" sentinel (accepted by
+// validateOptionalUUID) to empty, so payload builders never embed the
+// literal string "none" as an entity reference.
+func normalizeOptionalUUID(id string) string {
+	if id == "none" {
+		return ""
+	}
+	return id
+}
+
 func parseUUIDList(name, raw string) ([]string, error) {
 	if raw == "" {
 		return []string{}, nil
@@ -643,6 +653,10 @@ func historyWrite(env writeEnvelope) error {
 	return nil
 }
 
+// writeToHistory is the seam through which every mutation reaches Things
+// Cloud. Overridable in tests to capture envelopes without a network.
+var writeToHistory = historyWrite
+
 func isConflictError(err error) bool {
 	var statusErr *thingscloud.HTTPStatusError
 	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusConflict
@@ -690,6 +704,8 @@ func createTask(req CreateTaskRequest) (string, error) {
 	if err := validateOptionalUUID("parent_task", req.ParentTask); err != nil {
 		return "", err
 	}
+	req.Project = normalizeOptionalUUID(req.Project)
+	req.ParentTask = normalizeOptionalUUID(req.ParentTask)
 	tg, err := parseUUIDList("tags", req.Tags)
 	if err != nil {
 		return "", err
@@ -788,7 +804,7 @@ func createTask(req CreateTaskRequest) (string, error) {
 	}
 
 	env := writeEnvelope{id: taskUUID, action: 0, kind: "Task6", payload: payload}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return "", err
 	}
 	syncAfterWrite()
@@ -805,7 +821,7 @@ func completeTask(uuid string) error {
 	ts := nowTs()
 	u := newTaskUpdate().status(3).stopDate(ts)
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return err
 	}
 	syncAfterWrite()
@@ -821,7 +837,7 @@ func trashTask(uuid string) error {
 	}
 	u := newTaskUpdate().trash(true)
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return err
 	}
 	syncAfterWrite()
@@ -875,7 +891,7 @@ func editTask(req EditTaskRequest) error {
 		return err
 	}
 	env := writeEnvelope{id: req.UUID, action: 1, kind: "Task6", payload: fields}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return err
 	}
 	syncAfterWrite()
@@ -976,7 +992,7 @@ func moveTaskToToday(uuid string) error {
 	today := todayMidnightUTC()
 	u := newTaskUpdate().schedule(1, today, today)
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return err
 	}
 	syncAfterWrite()
@@ -992,7 +1008,7 @@ func moveTaskToAnytime(uuid string) error {
 	}
 	u := newTaskUpdate().schedule(1, nil, nil)
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return err
 	}
 	syncAfterWrite()
@@ -1008,7 +1024,7 @@ func moveTaskToSomeday(uuid string) error {
 	}
 	u := newTaskUpdate().schedule(2, nil, nil)
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return err
 	}
 	syncAfterWrite()
@@ -1024,7 +1040,7 @@ func moveTaskToInbox(uuid string) error {
 	}
 	u := newTaskUpdate().schedule(0, nil, nil)
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return err
 	}
 	syncAfterWrite()
@@ -1041,7 +1057,7 @@ func uncompleteTask(uuid string) error {
 	u := newTaskUpdate().status(0)
 	u.fields["sp"] = nil
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return err
 	}
 	syncAfterWrite()
@@ -1057,7 +1073,7 @@ func untrashTask(uuid string) error {
 	}
 	u := newTaskUpdate().trash(false)
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return err
 	}
 	syncAfterWrite()
@@ -1080,7 +1096,7 @@ func createArea(title string, tagUUIDs []string) (string, error) {
 		"xx": defaultExtension(),
 	}
 	env := writeEnvelope{id: areaUUID, action: 0, kind: "Area3", payload: payload}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return "", err
 	}
 	syncAfterWrite()
@@ -1091,7 +1107,8 @@ func createTag(title, shorthand, parentUUID string) (string, error) {
 	if err := validateOptionalUUID("parent", parentUUID); err != nil {
 		return "", err
 	}
-	if parentUUID != "" && parentUUID != "none" {
+	parentUUID = normalizeOptionalUUID(parentUUID)
+	if parentUUID != "" {
 		if err := requireTag(validationState(), "parent", parentUUID); err != nil {
 			return "", err
 		}
@@ -1113,7 +1130,7 @@ func createTag(title, shorthand, parentUUID string) (string, error) {
 		"xx": defaultExtension(),
 	}
 	env := writeEnvelope{id: tagUUID, action: 0, kind: "Tag4", payload: payload}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return "", err
 	}
 	syncAfterWrite()
@@ -1124,7 +1141,8 @@ func createHeading(title, projectUUID string) (string, error) {
 	if err := validateOptionalUUID("project", projectUUID); err != nil {
 		return "", err
 	}
-	if projectUUID != "" && projectUUID != "none" {
+	projectUUID = normalizeOptionalUUID(projectUUID)
+	if projectUUID != "" {
 		if err := requireProject(validationState(), "project", projectUUID); err != nil {
 			return "", err
 		}
@@ -1148,7 +1166,7 @@ func createHeading(title, projectUUID string) (string, error) {
 	}
 
 	env := writeEnvelope{id: headingUUID, action: 0, kind: "Task6", payload: payload}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return "", err
 	}
 	syncAfterWrite()
@@ -1159,7 +1177,8 @@ func createProject(title, note, when, deadline, areaUUID string) (string, error)
 	if err := validateOptionalUUID("area", areaUUID); err != nil {
 		return "", err
 	}
-	if areaUUID != "" && areaUUID != "none" {
+	areaUUID = normalizeOptionalUUID(areaUUID)
+	if areaUUID != "" {
 		if err := requireArea(validationState(), "area", areaUUID); err != nil {
 			return "", err
 		}
@@ -1218,7 +1237,7 @@ func createProject(title, note, when, deadline, areaUUID string) (string, error)
 	}
 
 	env := writeEnvelope{id: projectUUID, action: 0, kind: "Task6", payload: payload}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return "", err
 	}
 	syncAfterWrite()
@@ -1254,7 +1273,7 @@ func createChecklistItem(title, taskUUID string) (string, error) {
 		"xx": defaultExtension(),
 	}
 	env := writeEnvelope{id: itemUUID, action: 0, kind: "ChecklistItem3", payload: payload}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return "", err
 	}
 	syncAfterWrite()
@@ -1275,7 +1294,7 @@ func completeChecklistItem(uuid string) error {
 		"sp": ts,
 	}
 	env := writeEnvelope{id: uuid, action: 1, kind: "ChecklistItem3", payload: payload}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return err
 	}
 	syncAfterWrite()
@@ -1295,7 +1314,7 @@ func uncompleteChecklistItem(uuid string) error {
 		"sp": nil,
 	}
 	env := writeEnvelope{id: uuid, action: 1, kind: "ChecklistItem3", payload: payload}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return err
 	}
 	syncAfterWrite()
@@ -1316,7 +1335,7 @@ func deleteChecklistItem(uuid string) error {
 		"dld":   nowTs(),
 	}
 	env := writeEnvelope{id: tombUUID, action: 0, kind: "Tombstone2", payload: payload}
-	if err := historyWrite(env); err != nil {
+	if err := writeToHistory(env); err != nil {
 		return err
 	}
 	syncAfterWrite()
