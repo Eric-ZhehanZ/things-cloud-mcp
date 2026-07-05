@@ -542,6 +542,17 @@ func mcpEditTask(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResul
 	return writeResult(map[string]string{"status": "updated", "uuid": uuid}), nil
 }
 
+func mcpCancelTask(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	uuid, err := req.RequireString("uuid")
+	if err != nil {
+		return mcp.NewToolResultError("uuid is required"), nil
+	}
+	if err := cancelTask(uuid); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return writeResult(map[string]string{"status": "canceled", "uuid": uuid}), nil
+}
+
 func mcpTrashTask(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	uuid, err := req.RequireString("uuid")
 	if err != nil {
@@ -1225,6 +1236,14 @@ func newMCPHandler() http.Handler {
 		),
 	), mcpEditTask)
 
+	s.AddTool(mcp.NewTool("things_cancel_task",
+		mcp.WithDescription("Mark a Things task as canceled — it moves to the Logbook as 'won't do' instead of completed"),
+		mcp.WithString("uuid",
+			mcp.Required(),
+			mcp.Description("UUID of the task to cancel"),
+		),
+	), mcpCancelTask)
+
 	s.AddTool(mcp.NewTool("things_trash_task",
 		mcp.WithDescription("Move a Things task to the trash"),
 		mcp.WithDestructiveHintAnnotation(true),
@@ -1267,7 +1286,7 @@ func newMCPHandler() http.Handler {
 	), mcpMoveToInbox)
 
 	s.AddTool(mcp.NewTool("things_uncomplete_task",
-		mcp.WithDescription("Mark a completed Things task as open again"),
+		mcp.WithDescription("Mark a completed or canceled Things task as open again"),
 		mcp.WithString("uuid",
 			mcp.Required(),
 			mcp.Description("UUID of the task to uncomplete"),

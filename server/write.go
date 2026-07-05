@@ -916,6 +916,23 @@ func completeTask(uuid string) error {
 	return nil
 }
 
+func cancelTask(uuid string) error {
+	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
+		return err
+	}
+	ts := nowTs()
+	u := newTaskUpdate().status(2).stopDate(ts)
+	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
+	if err := writeToHistory(env); err != nil {
+		return err
+	}
+	syncAfterWrite()
+	return nil
+}
+
 func trashTask(uuid string) error {
 	if err := validateUUID("uuid", uuid); err != nil {
 		return err
