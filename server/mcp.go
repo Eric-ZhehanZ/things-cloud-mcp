@@ -419,6 +419,32 @@ func mcpListAreaTasks(_ context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 	return tasksResult(tasks), nil
 }
 
+func mcpListTagTasks(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	tagUUID, err := req.RequireString("tag_uuid")
+	if err != nil {
+		return mcp.NewToolResultError("tag_uuid is required"), nil
+	}
+	opts, err := mcpPaginationOpts(req)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if syncErr := syncForMCPReadResult(); syncErr != nil {
+		return syncErr, nil
+	}
+	tag, err := syncer.State().Tag(tagUUID)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if tag == nil {
+		return mcp.NewToolResultError("tag not found"), nil
+	}
+	tasks, err := syncer.State().TasksWithTag(tagUUID, opts)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return tasksResult(tasks), nil
+}
+
 func mcpListCompleted(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if syncErr := syncForMCPReadResult(); syncErr != nil {
 		return syncErr, nil
@@ -1172,6 +1198,23 @@ func newMCPHandler() http.Handler {
 			mcp.Min(0),
 		),
 	), mcpListAreaTasks)
+
+	s.AddTool(mcp.NewTool("things_list_tag_tasks",
+		mcp.WithDescription("List open tasks carrying a specific Things tag"),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithString("tag_uuid",
+			mcp.Required(),
+			mcp.Description("UUID of the tag (find it via things_list_tags)"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Maximum number of tasks to return"),
+			mcp.Min(0),
+		),
+		mcp.WithNumber("offset",
+			mcp.Description("Number of tasks to skip before returning results"),
+			mcp.Min(0),
+		),
+	), mcpListTagTasks)
 
 	s.AddTool(mcp.NewTool("things_list_completed",
 		mcp.WithDescription("List recently completed tasks, ordered by completion date (most recent first)"),
