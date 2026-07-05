@@ -304,6 +304,23 @@ func (st *State) TasksInArea(areaUUID string, opts QueryOpts) ([]*things.Task, e
 	return st.scanTaskUUIDs(rows)
 }
 
+// TasksWithTag returns tasks carrying the given tag
+func (st *State) TasksWithTag(tagUUID string, opts QueryOpts) ([]*things.Task, error) {
+	query := `SELECT t.uuid FROM tasks t
+		JOIN task_tags tt ON tt.task_uuid = t.uuid
+		WHERE tt.tag_uuid = ? AND t.type = 0 AND t.deleted = 0`
+	args := []any{tagUUID}
+	if !opts.IncludeCompleted {
+		query += " AND t.status != 3"
+	}
+	if !opts.IncludeTrashed {
+		query += " AND t.in_trash = 0"
+	}
+	query += ` ORDER BY t."index"`
+	query, args = paginateQuery(query, args, opts)
+	return st.queryTasks(query, args...)
+}
+
 // CompletedTasks returns completed tasks, ordered by completion date (most recent first)
 func (st *State) CompletedTasks(limit int) ([]*things.Task, error) {
 	return st.CompletedTasksInRange(limit, nil, nil)

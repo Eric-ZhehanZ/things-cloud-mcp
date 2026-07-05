@@ -320,6 +320,17 @@ func requireProject(st entityStore, name, uuid string) error {
 	return nil
 }
 
+func requireHeading(st entityStore, name, uuid string) error {
+	task, err := requireTask(st, name, uuid)
+	if err != nil {
+		return err
+	}
+	if task.Type != thingscloud.TaskTypeHeading {
+		return invalidInputf("%s is not a heading: %s", name, uuid)
+	}
+	return nil
+}
+
 func requireArea(st entityStore, name, uuid string) error {
 	area, err := st.Area(uuid)
 	if err != nil {
@@ -422,6 +433,16 @@ func (u *taskUpdate) schedule(st int, sr, tir any) *taskUpdate {
 	return u
 }
 
+func (u *taskUpdate) reminder(seconds int) *taskUpdate {
+	u.fields["ato"] = seconds
+	return u
+}
+
+func (u *taskUpdate) clearReminder() *taskUpdate {
+	u.fields["ato"] = nil
+	return u
+}
+
 func (u *taskUpdate) deadline(dd int64) *taskUpdate {
 	u.fields["dd"] = dd
 	return u
@@ -434,6 +455,16 @@ func (u *taskUpdate) clearDeadline() *taskUpdate {
 
 func (u *taskUpdate) project(uuid string) *taskUpdate {
 	u.fields["pr"] = []string{uuid}
+	return u
+}
+
+func (u *taskUpdate) heading(uuid string) *taskUpdate {
+	u.fields["agr"] = []string{uuid}
+	return u
+}
+
+func (u *taskUpdate) clearHeading() *taskUpdate {
+	u.fields["agr"] = []string{}
 	return u
 }
 
@@ -468,8 +499,10 @@ type CreateTaskRequest struct {
 	Deadline   string `json:"deadline,omitempty"`    // YYYY-MM-DD
 	Project    string `json:"project,omitempty"`     // project UUID
 	ParentTask string `json:"parent_task,omitempty"` // parent task UUID (for subtasks)
+	Heading    string `json:"heading,omitempty"`     // heading UUID (agr) to place the task under
 	Tags       string `json:"tags,omitempty"`        // comma-separated tag UUIDs
 	Repeat     string `json:"repeat,omitempty"`      // daily, weekly, monthly, yearly, every N days/weeks/months/years, optional "until YYYY-MM-DD"
+	Reminder   string `json:"reminder,omitempty"`    // HH:MM (24h); requires a dated when (today or YYYY-MM-DD)
 }
 
 // EditTaskRequest is the JSON body for POST /api/tasks/edit.
@@ -481,9 +514,11 @@ type EditTaskRequest struct {
 	Deadline   string `json:"deadline,omitempty"`
 	Project    string `json:"project,omitempty"`
 	ParentTask string `json:"parent_task,omitempty"`
+	Heading    string `json:"heading,omitempty"` // heading UUID (agr), or "none" to detach
 	Area       string `json:"area,omitempty"`
 	Tags       string `json:"tags,omitempty"`
-	Repeat     string `json:"repeat,omitempty"` // daily, weekly, monthly, yearly, every N days/weeks/months/years, optional "until YYYY-MM-DD", none
+	Repeat     string `json:"repeat,omitempty"`   // daily, weekly, monthly, yearly, every N days/weeks/months/years, optional "until YYYY-MM-DD", none
+	Reminder   string `json:"reminder,omitempty"` // HH:MM (24h) or "none" to clear; requires the task to keep a dated when
 }
 
 // UUIDRequest is the JSON body for complete/trash endpoints.
@@ -662,6 +697,29 @@ func isConflictError(err error) bool {
 	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusConflict
 }
 
+// parseReminder parses a 24h "HH:MM" reminder time into seconds after
+// midnight of the task's scheduled day (the wire ato field).
+func parseReminder(s string) (int, error) {
+	t, err := time.Parse("15:04", s)
+	if err != nil {
+		return 0, invalidInputf("reminder must be 24h HH:MM format, got: %s", s)
+	}
+	return t.Hour()*3600 + t.Minute()*60, nil
+}
+
+// editKeepsDate reports whether the task will still carry a scheduled day
+// after the edit — the anchor a reminder needs.
+func editKeepsDate(req EditTaskRequest, task *thingscloud.Task) bool {
+	if req.When == "none" {
+		return false
+	}
+	if req.When != "" {
+		_, sr, tir, ok := parseWhen(req.When)
+		return ok && (sr != nil || tir != nil)
+	}
+	return task.ScheduledDate != nil || task.TodayIndexReference != nil
+}
+
 // parseWhen interprets the when parameter. Returns (st, sr, tir, handled).
 // For named values (today/anytime/someday/inbox/none) and YYYY-MM-DD dates.
 // A future date goes to Upcoming (st=2), today's date goes to Today (st=1).
@@ -704,8 +762,12 @@ func createTask(req CreateTaskRequest) (string, error) {
 	if err := validateOptionalUUID("parent_task", req.ParentTask); err != nil {
 		return "", err
 	}
+	if err := validateOptionalUUID("heading", req.Heading); err != nil {
+		return "", err
+	}
 	req.Project = normalizeOptionalUUID(req.Project)
 	req.ParentTask = normalizeOptionalUUID(req.ParentTask)
+	req.Heading = normalizeOptionalUUID(req.Heading)
 	tg, err := parseUUIDList("tags", req.Tags)
 	if err != nil {
 		return "", err
@@ -719,6 +781,11 @@ func createTask(req CreateTaskRequest) (string, error) {
 	}
 	if req.ParentTask != "" {
 		if _, err := requireTask(state, "parent_task", req.ParentTask); err != nil {
+			return "", err
+		}
+	}
+	if req.Heading != "" {
+		if err := requireHeading(state, "heading", req.Heading); err != nil {
 			return "", err
 		}
 	}
@@ -765,11 +832,32 @@ func createTask(req CreateTaskRequest) (string, error) {
 		dd = &ts
 	}
 
+	var ato *int
+	if req.Reminder != "" && req.Reminder != "none" {
+		sec, err := parseReminder(req.Reminder)
+		if err != nil {
+			return "", err
+		}
+		if sr == nil {
+			return "", invalidInputf("reminder requires a scheduled date; set when to today or YYYY-MM-DD")
+		}
+		ato = &sec
+	}
+
 	pr := []string{}
 	if req.ParentTask != "" {
 		pr = []string{req.ParentTask}
 	} else if req.Project != "" {
 		pr = []string{req.Project}
+		if req.When == "" {
+			st = 1
+		}
+	}
+
+	agr := []string{}
+	if req.Heading != "" {
+		agr = []string{req.Heading}
+		// Tasks under headings are structural — never inbox unless asked.
 		if req.When == "" {
 			st = 1
 		}
@@ -797,8 +885,8 @@ func createTask(req CreateTaskRequest) (string, error) {
 		Tp: 0, Sr: sr, Dds: nil, Rt: []string{}, Rmd: nil,
 		Ss: 0, Tr: false, Dl: []string{}, Icp: false, St: st,
 		Ar: []string{}, Tt: req.Title, Do: 0, Lai: nil, Tir: tir,
-		Tg: tg, Agr: []string{}, Ix: 0, Cd: now, Lt: false,
-		Icc: 0, Md: nil, Ti: 0, Dd: dd, Ato: nil, Nt: nt,
+		Tg: tg, Agr: agr, Ix: 0, Cd: now, Lt: false,
+		Icc: 0, Md: nil, Ti: 0, Dd: dd, Ato: ato, Nt: nt,
 		Icsd: nil, Pr: pr, Rp: nil, Acrd: nil, Sp: nil,
 		Sb: 0, Rr: rr, Xx: defaultExtension(),
 	}
@@ -820,6 +908,23 @@ func completeTask(uuid string) error {
 	}
 	ts := nowTs()
 	u := newTaskUpdate().status(3).stopDate(ts)
+	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
+	if err := writeToHistory(env); err != nil {
+		return err
+	}
+	syncAfterWrite()
+	return nil
+}
+
+func cancelTask(uuid string) error {
+	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
+		return err
+	}
+	ts := nowTs()
+	u := newTaskUpdate().status(2).stopDate(ts)
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
 	if err := writeToHistory(env); err != nil {
 		return err
@@ -854,6 +959,9 @@ func editTask(req EditTaskRequest) error {
 	if err := validateOptionalUUID("parent_task", req.ParentTask); err != nil {
 		return err
 	}
+	if err := validateOptionalUUID("heading", req.Heading); err != nil {
+		return err
+	}
 	if err := validateOptionalUUID("area", req.Area); err != nil {
 		return err
 	}
@@ -866,6 +974,11 @@ func editTask(req EditTaskRequest) error {
 	task, err := requireTask(st, "uuid", req.UUID)
 	if err != nil {
 		return err
+	}
+	if req.Heading != "" && req.Heading != "none" {
+		if err := requireHeading(st, "heading", req.Heading); err != nil {
+			return err
+		}
 	}
 	if req.Project != "" && req.Project != "none" {
 		if err := requireProject(st, "project", req.Project); err != nil {
@@ -917,12 +1030,30 @@ func buildEditUpdate(req EditTaskRequest, task *thingscloud.Task) (map[string]an
 	if req.When == "none" {
 		u.fields["sr"] = nil
 		u.fields["tir"] = nil
+		// A reminder can't outlive its scheduled day.
+		u.clearReminder()
 	} else if req.When != "" {
 		st, sr, tir, ok := parseWhen(req.When)
 		if !ok {
 			return nil, invalidInputf("invalid when value: %s (use today, anytime, someday, inbox, none, or YYYY-MM-DD)", req.When)
 		}
 		u.schedule(st, sr, tir)
+		if sr == nil && tir == nil {
+			// Undated schedules (anytime/someday/inbox) drop any reminder.
+			u.clearReminder()
+		}
+	}
+	if req.Reminder == "none" {
+		u.clearReminder()
+	} else if req.Reminder != "" {
+		sec, err := parseReminder(req.Reminder)
+		if err != nil {
+			return nil, err
+		}
+		if !editKeepsDate(req, task) {
+			return nil, invalidInputf("reminder requires a scheduled date; set when to today or YYYY-MM-DD")
+		}
+		u.reminder(sec)
 	}
 	if req.Deadline == "none" {
 		u.clearDeadline()
@@ -951,6 +1082,15 @@ func buildEditUpdate(req EditTaskRequest, task *thingscloud.Task) (map[string]an
 	// already has a date keeps it.
 	if (assigningParent || assigningProject) && req.When == "" && task.Schedule == thingscloud.TaskScheduleInbox {
 		u.schedule(1, nil, nil)
+	}
+	if req.Heading == "none" {
+		u.clearHeading()
+	} else if req.Heading != "" {
+		u.heading(req.Heading)
+		// Headed tasks are structural — leave the inbox unless when says otherwise.
+		if req.When == "" && task.Schedule == thingscloud.TaskScheduleInbox {
+			u.schedule(1, nil, nil)
+		}
 	}
 	if req.Tags != "" {
 		tags, err := parseUUIDList("tags", req.Tags)
@@ -1006,7 +1146,7 @@ func moveTaskToAnytime(uuid string) error {
 	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
 		return err
 	}
-	u := newTaskUpdate().schedule(1, nil, nil)
+	u := newTaskUpdate().schedule(1, nil, nil).clearReminder()
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
 	if err := writeToHistory(env); err != nil {
 		return err
@@ -1022,7 +1162,7 @@ func moveTaskToSomeday(uuid string) error {
 	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
 		return err
 	}
-	u := newTaskUpdate().schedule(2, nil, nil)
+	u := newTaskUpdate().schedule(2, nil, nil).clearReminder()
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
 	if err := writeToHistory(env); err != nil {
 		return err
@@ -1038,7 +1178,7 @@ func moveTaskToInbox(uuid string) error {
 	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
 		return err
 	}
-	u := newTaskUpdate().schedule(0, nil, nil)
+	u := newTaskUpdate().schedule(0, nil, nil).clearReminder()
 	env := writeEnvelope{id: uuid, action: 1, kind: "Task6", payload: u.build()}
 	if err := writeToHistory(env); err != nil {
 		return err
@@ -1080,6 +1220,28 @@ func untrashTask(uuid string) error {
 	return nil
 }
 
+// purgeTask permanently deletes a task via Tombstone2. Unlike trash, this
+// cannot be undone — the event removes the task from every synced device.
+func purgeTask(uuid string) error {
+	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if _, err := requireTask(validationState(), "uuid", uuid); err != nil {
+		return err
+	}
+	tombUUID := generateUUID()
+	payload := map[string]any{
+		"dloid": uuid,
+		"dld":   nowTs(),
+	}
+	env := writeEnvelope{id: tombUUID, action: 0, kind: "Tombstone2", payload: payload}
+	if err := writeToHistory(env); err != nil {
+		return err
+	}
+	syncAfterWrite()
+	return nil
+}
+
 func createArea(title string, tagUUIDs []string) (string, error) {
 	areaUUID := generateUUID()
 	validatedTags, err := validateUUIDSlice("tags", tagUUIDs)
@@ -1101,6 +1263,25 @@ func createArea(title string, tagUUIDs []string) (string, error) {
 	}
 	syncAfterWrite()
 	return areaUUID, nil
+}
+
+func editArea(uuid, title string) error {
+	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if title == "" {
+		return invalidInputf("title is required")
+	}
+	if err := requireArea(validationState(), "uuid", uuid); err != nil {
+		return err
+	}
+	payload := map[string]any{"tt": title}
+	env := writeEnvelope{id: uuid, action: 1, kind: "Area3", payload: payload}
+	if err := writeToHistory(env); err != nil {
+		return err
+	}
+	syncAfterWrite()
+	return nil
 }
 
 func createTag(title, shorthand, parentUUID string) (string, error) {
@@ -1135,6 +1316,33 @@ func createTag(title, shorthand, parentUUID string) (string, error) {
 	}
 	syncAfterWrite()
 	return tagUUID, nil
+}
+
+func editTag(uuid, title, shorthand string) error {
+	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if title == "" && shorthand == "" {
+		return invalidInputf("nothing to change: set title and/or shorthand")
+	}
+	if err := requireTag(validationState(), "uuid", uuid); err != nil {
+		return err
+	}
+	payload := map[string]any{}
+	if title != "" {
+		payload["tt"] = title
+	}
+	if shorthand == "none" {
+		payload["sh"] = nil
+	} else if shorthand != "" {
+		payload["sh"] = shorthand
+	}
+	env := writeEnvelope{id: uuid, action: 1, kind: "Tag4", payload: payload}
+	if err := writeToHistory(env); err != nil {
+		return err
+	}
+	syncAfterWrite()
+	return nil
 }
 
 func createHeading(title, projectUUID string) (string, error) {
@@ -1312,6 +1520,28 @@ func uncompleteChecklistItem(uuid string) error {
 		"md": nowTs(),
 		"ss": 0,
 		"sp": nil,
+	}
+	env := writeEnvelope{id: uuid, action: 1, kind: "ChecklistItem3", payload: payload}
+	if err := writeToHistory(env); err != nil {
+		return err
+	}
+	syncAfterWrite()
+	return nil
+}
+
+func editChecklistItem(uuid, title string) error {
+	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if title == "" {
+		return invalidInputf("title is required")
+	}
+	if err := requireChecklistItem(validationState(), uuid); err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"md": nowTs(),
+		"tt": title,
 	}
 	env := writeEnvelope{id: uuid, action: 1, kind: "ChecklistItem3", payload: payload}
 	if err := writeToHistory(env); err != nil {
