@@ -884,8 +884,34 @@ func countStatus(checks []smokeCheck, status string) int {
 // MCP server setup
 // ---------------------------------------------------------------------------
 
+const (
+	mcpServerName    = "Things Cloud"
+	mcpServerTitle   = "Things Cloud (Things 3)"
+	mcpServerVersion = "1.2.0"
+)
+
+const mcpServerInstructions = `Read/write access to a Things 3 account via Things Cloud sync.
+
+Conventions:
+- Entities are referenced by Things Base58 UUIDs. Get UUIDs from the list, search, and get tools — never invent them. Writes are rejected when the target UUID does not exist in synced state.
+- 'when' controls scheduling (today, anytime, someday, inbox, or YYYY-MM-DD; a future date lands in Upcoming). 'deadline' is a hard due date — only set it when the user explicitly asks for one.
+- Checklist items are lightweight checkboxes inside a task. Subtasks are full tasks created via things_create_task with parent_task.
+- Trashing a task is reversible (things_untrash_task). Deleting a checklist item is permanent.
+- things_smoke_test writes to the real account (it creates, edits, completes, and trashes a "[smoke-test]" task); run it only as a diagnostic.
+- Reads sync from Things Cloud on demand, throttled to at most one sync every few seconds; reads immediately after a write are already fresh.`
+
 func newMCPHandler() http.Handler {
-	s := server.NewMCPServer("Things Cloud", "1.1.0")
+	hooks := &server.Hooks{}
+	// mcp-go's initialize response only carries name and version; fill in the
+	// display title here.
+	hooks.AddAfterInitialize(func(_ context.Context, _ any, _ *mcp.InitializeRequest, result *mcp.InitializeResult) {
+		result.ServerInfo.Title = mcpServerTitle
+	})
+
+	s := server.NewMCPServer(mcpServerName, mcpServerVersion,
+		server.WithInstructions(mcpServerInstructions),
+		server.WithHooks(hooks),
+	)
 
 	// --- Read tools ---
 
@@ -1148,10 +1174,10 @@ func newMCPHandler() http.Handler {
 			mcp.Description("Hard deadline in YYYY-MM-DD format, or 'none' to clear an existing deadline. Only use when the user explicitly mentions a deadline or due date — not for general scheduling."),
 		),
 		mcp.WithString("project",
-			mcp.Description("New project UUID"),
+			mcp.Description("New project UUID, or 'none' to remove the task from its project"),
 		),
 		mcp.WithString("parent_task",
-			mcp.Description("Move task under a parent task (make it a subtask). Takes precedence over project."),
+			mcp.Description("Move task under a parent task (make it a subtask), or 'none' to detach. Takes precedence over project."),
 		),
 		mcp.WithString("area",
 			mcp.Description("Area UUID to assign the task to, or 'none' to remove from area"),

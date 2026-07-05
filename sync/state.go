@@ -340,6 +340,13 @@ func (st *State) CompletedTasksInRange(limit int, completedAfter, completedBefor
 	return st.scanTaskUUIDs(rows)
 }
 
+// ChecklistItem retrieves a checklist item by UUID
+func (st *State) ChecklistItem(uuid string) (*things.CheckListItem, error) {
+	st.syncer.mu.RLock()
+	defer st.syncer.mu.RUnlock()
+	return st.syncer.readSyncer().getChecklistItem(uuid)
+}
+
 // ChecklistItems returns checklist items for a task
 func (st *State) ChecklistItems(taskUUID string) ([]*things.CheckListItem, error) {
 	st.syncer.mu.RLock()

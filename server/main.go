@@ -320,6 +320,16 @@ func mcpAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// limitRequestBody caps request bodies read by next. The REST handlers cap
+// their own reads via decodeJSONBody; the MCP handler reads unbounded input
+// without this.
+func limitRequestBody(limit int64, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
+		next.ServeHTTP(w, r)
+	})
+}
+
 func debugAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if os.Getenv("DEBUG") != "true" {
@@ -576,7 +586,7 @@ func main() {
 	}))
 
 	// MCP endpoint — protected by API_KEY when set (bearer header or ?key= query param)
-	http.Handle("/mcp", mcpAuthMiddleware(newMCPHandler()))
+	http.Handle("/mcp", mcpAuthMiddleware(limitRequestBody(maxJSONBodyBytes, newMCPHandler())))
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

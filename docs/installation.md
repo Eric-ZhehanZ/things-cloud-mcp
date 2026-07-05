@@ -176,6 +176,7 @@ Fly.io doesn't bill you if your monthly usage is under $5. The server scales to 
 | `THINGS_USERNAME` | Yes | Your Things account email |
 | `THINGS_PASSWORD` | Yes | Your Things account password |
 | `API_KEY` | No | Auth token for the MCP endpoint (`/mcp`) and REST API (`/api/*`). Sent as `Authorization: Bearer <key>`, or as `?key=<key>` on `/mcp` for clients that can't set headers. If unset, no auth required (not recommended). |
+| `SYNC_MIN_INTERVAL` | No | Minimum seconds between on-demand syncs against Things Cloud (default: `2`). Bursts of reads reuse the local mirror instead of re-syncing; reads right after a write are always fresh. |
 | `PORT` | No | Server port (default: `8080`) |
 | `DEBUG` | No | Set to `true` for verbose HTTP logging |
 
