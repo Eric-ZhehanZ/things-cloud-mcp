@@ -320,6 +320,17 @@ func requireProject(st entityStore, name, uuid string) error {
 	return nil
 }
 
+func requireHeading(st entityStore, name, uuid string) error {
+	task, err := requireTask(st, name, uuid)
+	if err != nil {
+		return err
+	}
+	if task.Type != thingscloud.TaskTypeHeading {
+		return invalidInputf("%s is not a heading: %s", name, uuid)
+	}
+	return nil
+}
+
 func requireArea(st entityStore, name, uuid string) error {
 	area, err := st.Area(uuid)
 	if err != nil {
@@ -447,6 +458,16 @@ func (u *taskUpdate) project(uuid string) *taskUpdate {
 	return u
 }
 
+func (u *taskUpdate) heading(uuid string) *taskUpdate {
+	u.fields["agr"] = []string{uuid}
+	return u
+}
+
+func (u *taskUpdate) clearHeading() *taskUpdate {
+	u.fields["agr"] = []string{}
+	return u
+}
+
 func (u *taskUpdate) area(uuid string) *taskUpdate {
 	u.fields["ar"] = []string{uuid}
 	return u
@@ -478,6 +499,7 @@ type CreateTaskRequest struct {
 	Deadline   string `json:"deadline,omitempty"`    // YYYY-MM-DD
 	Project    string `json:"project,omitempty"`     // project UUID
 	ParentTask string `json:"parent_task,omitempty"` // parent task UUID (for subtasks)
+	Heading    string `json:"heading,omitempty"`     // heading UUID (agr) to place the task under
 	Tags       string `json:"tags,omitempty"`        // comma-separated tag UUIDs
 	Repeat     string `json:"repeat,omitempty"`      // daily, weekly, monthly, yearly, every N days/weeks/months/years, optional "until YYYY-MM-DD"
 	Reminder   string `json:"reminder,omitempty"`    // HH:MM (24h); requires a dated when (today or YYYY-MM-DD)
@@ -492,6 +514,7 @@ type EditTaskRequest struct {
 	Deadline   string `json:"deadline,omitempty"`
 	Project    string `json:"project,omitempty"`
 	ParentTask string `json:"parent_task,omitempty"`
+	Heading    string `json:"heading,omitempty"` // heading UUID (agr), or "none" to detach
 	Area       string `json:"area,omitempty"`
 	Tags       string `json:"tags,omitempty"`
 	Repeat     string `json:"repeat,omitempty"`   // daily, weekly, monthly, yearly, every N days/weeks/months/years, optional "until YYYY-MM-DD", none
@@ -739,8 +762,12 @@ func createTask(req CreateTaskRequest) (string, error) {
 	if err := validateOptionalUUID("parent_task", req.ParentTask); err != nil {
 		return "", err
 	}
+	if err := validateOptionalUUID("heading", req.Heading); err != nil {
+		return "", err
+	}
 	req.Project = normalizeOptionalUUID(req.Project)
 	req.ParentTask = normalizeOptionalUUID(req.ParentTask)
+	req.Heading = normalizeOptionalUUID(req.Heading)
 	tg, err := parseUUIDList("tags", req.Tags)
 	if err != nil {
 		return "", err
@@ -754,6 +781,11 @@ func createTask(req CreateTaskRequest) (string, error) {
 	}
 	if req.ParentTask != "" {
 		if _, err := requireTask(state, "parent_task", req.ParentTask); err != nil {
+			return "", err
+		}
+	}
+	if req.Heading != "" {
+		if err := requireHeading(state, "heading", req.Heading); err != nil {
 			return "", err
 		}
 	}
@@ -822,6 +854,15 @@ func createTask(req CreateTaskRequest) (string, error) {
 		}
 	}
 
+	agr := []string{}
+	if req.Heading != "" {
+		agr = []string{req.Heading}
+		// Tasks under headings are structural — never inbox unless asked.
+		if req.When == "" {
+			st = 1
+		}
+	}
+
 	nt := emptyNote()
 	if req.Note != "" {
 		nt = textNote(req.Note)
@@ -844,7 +885,7 @@ func createTask(req CreateTaskRequest) (string, error) {
 		Tp: 0, Sr: sr, Dds: nil, Rt: []string{}, Rmd: nil,
 		Ss: 0, Tr: false, Dl: []string{}, Icp: false, St: st,
 		Ar: []string{}, Tt: req.Title, Do: 0, Lai: nil, Tir: tir,
-		Tg: tg, Agr: []string{}, Ix: 0, Cd: now, Lt: false,
+		Tg: tg, Agr: agr, Ix: 0, Cd: now, Lt: false,
 		Icc: 0, Md: nil, Ti: 0, Dd: dd, Ato: ato, Nt: nt,
 		Icsd: nil, Pr: pr, Rp: nil, Acrd: nil, Sp: nil,
 		Sb: 0, Rr: rr, Xx: defaultExtension(),
@@ -901,6 +942,9 @@ func editTask(req EditTaskRequest) error {
 	if err := validateOptionalUUID("parent_task", req.ParentTask); err != nil {
 		return err
 	}
+	if err := validateOptionalUUID("heading", req.Heading); err != nil {
+		return err
+	}
 	if err := validateOptionalUUID("area", req.Area); err != nil {
 		return err
 	}
@@ -913,6 +957,11 @@ func editTask(req EditTaskRequest) error {
 	task, err := requireTask(st, "uuid", req.UUID)
 	if err != nil {
 		return err
+	}
+	if req.Heading != "" && req.Heading != "none" {
+		if err := requireHeading(st, "heading", req.Heading); err != nil {
+			return err
+		}
 	}
 	if req.Project != "" && req.Project != "none" {
 		if err := requireProject(st, "project", req.Project); err != nil {
@@ -1016,6 +1065,15 @@ func buildEditUpdate(req EditTaskRequest, task *thingscloud.Task) (map[string]an
 	// already has a date keeps it.
 	if (assigningParent || assigningProject) && req.When == "" && task.Schedule == thingscloud.TaskScheduleInbox {
 		u.schedule(1, nil, nil)
+	}
+	if req.Heading == "none" {
+		u.clearHeading()
+	} else if req.Heading != "" {
+		u.heading(req.Heading)
+		// Headed tasks are structural — leave the inbox unless when says otherwise.
+		if req.When == "" && task.Schedule == thingscloud.TaskScheduleInbox {
+			u.schedule(1, nil, nil)
+		}
 	}
 	if req.Tags != "" {
 		tags, err := parseUUIDList("tags", req.Tags)
