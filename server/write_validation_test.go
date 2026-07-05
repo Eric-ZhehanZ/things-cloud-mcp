@@ -292,3 +292,98 @@ func TestSyncThrottleRetriesAfterFailure(t *testing.T) {
 }
 
 var errTestSyncFailed = &thingscloud.HTTPStatusError{StatusCode: 500, Status: "500 boom"}
+
+// withCapturedWrites stubs out the network so write ops succeed locally and
+// their envelopes can be inspected.
+func withCapturedWrites(t *testing.T) *[]writeEnvelope {
+	t.Helper()
+	origWrite, origSync := writeToHistory, doSync
+	var envs []writeEnvelope
+	writeToHistory = func(env writeEnvelope) error {
+		envs = append(envs, env)
+		return nil
+	}
+	doSync = func() error { return nil }
+	t.Cleanup(func() { writeToHistory, doSync = origWrite, origSync })
+	return &envs
+}
+
+func lastEnvelope(t *testing.T, envs *[]writeEnvelope) writeEnvelope {
+	t.Helper()
+	if len(*envs) == 0 {
+		t.Fatal("no write envelope captured")
+	}
+	return (*envs)[len(*envs)-1]
+}
+
+func TestCreateOpsTreatNoneAsUnset(t *testing.T) {
+	withFakeStore(t, populatedStore())
+	envs := withCapturedWrites(t)
+
+	t.Run("tag parent none", func(t *testing.T) {
+		if _, err := createTag("t", "", "none"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		payload := lastEnvelope(t, envs).payload.(map[string]any)
+		if pn := payload["pn"].([]string); len(pn) != 0 {
+			t.Fatalf("parent 'none' must not be written as a reference, got pn=%v", pn)
+		}
+	})
+
+	t.Run("heading project none", func(t *testing.T) {
+		if _, err := createHeading("h", "none"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		payload := lastEnvelope(t, envs).payload.(taskCreatePayload)
+		if len(payload.Pr) != 0 {
+			t.Fatalf("project 'none' must not be written as a reference, got pr=%v", payload.Pr)
+		}
+	})
+
+	t.Run("project area none", func(t *testing.T) {
+		if _, err := createProject("p", "", "", "", "none"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		payload := lastEnvelope(t, envs).payload.(taskCreatePayload)
+		if len(payload.Ar) != 0 {
+			t.Fatalf("area 'none' must not be written as a reference, got ar=%v", payload.Ar)
+		}
+	})
+
+	t.Run("task project none", func(t *testing.T) {
+		if _, err := createTask(CreateTaskRequest{Title: "x", Project: "none"}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		payload := lastEnvelope(t, envs).payload.(taskCreatePayload)
+		if len(payload.Pr) != 0 {
+			t.Fatalf("project 'none' must not be written as a reference, got pr=%v", payload.Pr)
+		}
+	})
+
+	t.Run("task parent none", func(t *testing.T) {
+		if _, err := createTask(CreateTaskRequest{Title: "x", ParentTask: "none"}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		payload := lastEnvelope(t, envs).payload.(taskCreatePayload)
+		if len(payload.Pr) != 0 {
+			t.Fatalf("parent_task 'none' must not be written as a reference, got pr=%v", payload.Pr)
+		}
+	})
+}
+
+func TestCompleteTaskWritesUpdateEnvelope(t *testing.T) {
+	withFakeStore(t, populatedStore())
+	envs := withCapturedWrites(t)
+
+	if err := completeTask(testTaskUUID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	env := lastEnvelope(t, envs)
+	if env.id != testTaskUUID || env.action != 1 || env.kind != "Task6" {
+		t.Fatalf("unexpected envelope: id=%s action=%d kind=%s", env.id, env.action, env.kind)
+	}
+	fields := env.payload.(map[string]any)
+	if fields["ss"] != 3 {
+		t.Fatalf("complete should set ss=3, got %v", fields["ss"])
+	}
+}
