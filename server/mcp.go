@@ -646,6 +646,47 @@ func mcpCreateArea(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolRes
 	return writeResult(map[string]string{"status": "created", "uuid": uuid, "title": title}), nil
 }
 
+func mcpEditArea(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	uuid, err := req.RequireString("uuid")
+	if err != nil {
+		return mcp.NewToolResultError("uuid is required"), nil
+	}
+	title, err := req.RequireString("title")
+	if err != nil {
+		return mcp.NewToolResultError("title is required"), nil
+	}
+	if err := editArea(uuid, title); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return writeResult(map[string]string{"status": "updated", "uuid": uuid, "title": title}), nil
+}
+
+func mcpEditTag(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	uuid, err := req.RequireString("uuid")
+	if err != nil {
+		return mcp.NewToolResultError("uuid is required"), nil
+	}
+	if err := editTag(uuid, req.GetString("title", ""), req.GetString("shorthand", "")); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return writeResult(map[string]string{"status": "updated", "uuid": uuid}), nil
+}
+
+func mcpEditChecklistItem(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	uuid, err := req.RequireString("uuid")
+	if err != nil {
+		return mcp.NewToolResultError("uuid is required"), nil
+	}
+	title, err := req.RequireString("title")
+	if err != nil {
+		return mcp.NewToolResultError("title is required"), nil
+	}
+	if err := editChecklistItem(uuid, title); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return writeResult(map[string]string{"status": "updated", "uuid": uuid, "title": title}), nil
+}
+
 func mcpCreateTag(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	title, err := req.RequireString("title")
 	if err != nil {
@@ -1326,6 +1367,32 @@ func newMCPHandler() http.Handler {
 		),
 	), mcpCreateTag)
 
+	s.AddTool(mcp.NewTool("things_edit_area",
+		mcp.WithDescription("Rename an existing area in Things"),
+		mcp.WithString("uuid",
+			mcp.Required(),
+			mcp.Description("UUID of the area to edit"),
+		),
+		mcp.WithString("title",
+			mcp.Required(),
+			mcp.Description("New area title"),
+		),
+	), mcpEditArea)
+
+	s.AddTool(mcp.NewTool("things_edit_tag",
+		mcp.WithDescription("Edit an existing tag in Things — rename it and/or change its keyboard shortcut"),
+		mcp.WithString("uuid",
+			mcp.Required(),
+			mcp.Description("UUID of the tag to edit"),
+		),
+		mcp.WithString("title",
+			mcp.Description("New tag title"),
+		),
+		mcp.WithString("shorthand",
+			mcp.Description("New keyboard shortcut, or 'none' to remove it"),
+		),
+	), mcpEditTag)
+
 	s.AddTool(mcp.NewTool("things_create_heading",
 		mcp.WithDescription("Create a heading within a project in Things"),
 		mcp.WithString("title",
@@ -1382,6 +1449,18 @@ func newMCPHandler() http.Handler {
 			mcp.Description("UUID of the task to add the checklist item to"),
 		),
 	), mcpCreateChecklistItem)
+
+	s.AddTool(mcp.NewTool("things_edit_checklist_item",
+		mcp.WithDescription("Rename a checklist item (checkbox) inside a task"),
+		mcp.WithString("uuid",
+			mcp.Required(),
+			mcp.Description("UUID of the checklist item to rename"),
+		),
+		mcp.WithString("title",
+			mcp.Required(),
+			mcp.Description("New checklist item text"),
+		),
+	), mcpEditChecklistItem)
 
 	s.AddTool(mcp.NewTool("things_complete_checklist_item",
 		mcp.WithDescription("Mark a checklist item (checkbox) as completed"),

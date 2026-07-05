@@ -1243,6 +1243,25 @@ func createArea(title string, tagUUIDs []string) (string, error) {
 	return areaUUID, nil
 }
 
+func editArea(uuid, title string) error {
+	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if title == "" {
+		return invalidInputf("title is required")
+	}
+	if err := requireArea(validationState(), "uuid", uuid); err != nil {
+		return err
+	}
+	payload := map[string]any{"tt": title}
+	env := writeEnvelope{id: uuid, action: 1, kind: "Area3", payload: payload}
+	if err := writeToHistory(env); err != nil {
+		return err
+	}
+	syncAfterWrite()
+	return nil
+}
+
 func createTag(title, shorthand, parentUUID string) (string, error) {
 	if err := validateOptionalUUID("parent", parentUUID); err != nil {
 		return "", err
@@ -1275,6 +1294,33 @@ func createTag(title, shorthand, parentUUID string) (string, error) {
 	}
 	syncAfterWrite()
 	return tagUUID, nil
+}
+
+func editTag(uuid, title, shorthand string) error {
+	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if title == "" && shorthand == "" {
+		return invalidInputf("nothing to change: set title and/or shorthand")
+	}
+	if err := requireTag(validationState(), "uuid", uuid); err != nil {
+		return err
+	}
+	payload := map[string]any{}
+	if title != "" {
+		payload["tt"] = title
+	}
+	if shorthand == "none" {
+		payload["sh"] = nil
+	} else if shorthand != "" {
+		payload["sh"] = shorthand
+	}
+	env := writeEnvelope{id: uuid, action: 1, kind: "Tag4", payload: payload}
+	if err := writeToHistory(env); err != nil {
+		return err
+	}
+	syncAfterWrite()
+	return nil
 }
 
 func createHeading(title, projectUUID string) (string, error) {
@@ -1452,6 +1498,28 @@ func uncompleteChecklistItem(uuid string) error {
 		"md": nowTs(),
 		"ss": 0,
 		"sp": nil,
+	}
+	env := writeEnvelope{id: uuid, action: 1, kind: "ChecklistItem3", payload: payload}
+	if err := writeToHistory(env); err != nil {
+		return err
+	}
+	syncAfterWrite()
+	return nil
+}
+
+func editChecklistItem(uuid, title string) error {
+	if err := validateUUID("uuid", uuid); err != nil {
+		return err
+	}
+	if title == "" {
+		return invalidInputf("title is required")
+	}
+	if err := requireChecklistItem(validationState(), uuid); err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"md": nowTs(),
+		"tt": title,
 	}
 	env := writeEnvelope{id: uuid, action: 1, kind: "ChecklistItem3", payload: payload}
 	if err := writeToHistory(env); err != nil {
