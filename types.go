@@ -393,10 +393,11 @@ type Setting struct{}
 // 2|visible|INTEGER|0||0
 // 3|index|INTEGER|0||0
 type Area struct {
-	UUID  string
-	Title string
-	Tags  []*Tag
-	Tasks []*Task
+	UUID   string
+	Title  string
+	TagIDs []string
+	Tags   []*Tag
+	Tasks  []*Task
 }
 
 // AreaActionItemPayload describes the payload for modifying Areas
