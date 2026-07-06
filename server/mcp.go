@@ -42,19 +42,23 @@ type taskOutput struct {
 	Repeat        string   `json:"repeat,omitempty"`
 	TodayIndexRef string   `json:"today_index_ref,omitempty"`
 	ProjectID     string   `json:"project_id,omitempty"`
+	HeadingID     string   `json:"heading_id,omitempty"`
 	AreaID        string   `json:"area_id,omitempty"`
 	Tags          []string `json:"tags,omitempty"`
+	Trashed       bool     `json:"trashed,omitempty"`
 }
 
 type areaOutput struct {
-	UUID  string `json:"uuid"`
-	Title string `json:"title"`
+	UUID  string   `json:"uuid"`
+	Title string   `json:"title"`
+	Tags  []string `json:"tags,omitempty"`
 }
 
 type tagOutput struct {
 	UUID      string `json:"uuid"`
 	Title     string `json:"title"`
 	Shorthand string `json:"shorthand,omitempty"`
+	ParentID  string `json:"parent_id,omitempty"`
 }
 
 type checklistOutput struct {
@@ -109,8 +113,24 @@ func formatTask(t *things.Task) taskOutput {
 	if len(t.ParentTaskIDs) > 0 {
 		o.ProjectID = t.ParentTaskIDs[0]
 	}
+	if len(t.ActionGroupIDs) > 0 {
+		o.HeadingID = t.ActionGroupIDs[0]
+	}
 	if len(t.AreaIDs) > 0 {
 		o.AreaID = t.AreaIDs[0]
+	}
+	o.Trashed = t.InTrash
+	return o
+}
+
+func formatArea(a *things.Area) areaOutput {
+	return areaOutput{UUID: a.UUID, Title: a.Title, Tags: a.TagIDs}
+}
+
+func formatTag(t *things.Tag) tagOutput {
+	o := tagOutput{UUID: t.UUID, Title: t.Title, Shorthand: t.ShortHand}
+	if len(t.ParentTagIDs) > 0 {
+		o.ParentID = t.ParentTagIDs[0]
 	}
 	return o
 }
@@ -176,7 +196,7 @@ func tasksResult(tasks []*things.Task) *mcp.CallToolResult {
 func areasResult(areas []*things.Area) *mcp.CallToolResult {
 	out := make([]areaOutput, len(areas))
 	for i, a := range areas {
-		out[i] = areaOutput{UUID: a.UUID, Title: a.Title}
+		out[i] = formatArea(a)
 	}
 	return jsonToolResultWithIndent(out, true)
 }
@@ -184,7 +204,7 @@ func areasResult(areas []*things.Area) *mcp.CallToolResult {
 func tagsResult(tags []*things.Tag) *mcp.CallToolResult {
 	out := make([]tagOutput, len(tags))
 	for i, t := range tags {
-		out[i] = tagOutput{UUID: t.UUID, Title: t.Title, Shorthand: t.ShortHand}
+		out[i] = formatTag(t)
 	}
 	return jsonToolResultWithIndent(out, true)
 }
@@ -517,7 +537,7 @@ func mcpGetArea(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult
 	if area == nil {
 		return mcp.NewToolResultError("area not found"), nil
 	}
-	return jsonToolResultWithIndent(areaOutput{UUID: area.UUID, Title: area.Title}, true), nil
+	return jsonToolResultWithIndent(formatArea(area), true), nil
 }
 
 func mcpGetTag(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -535,7 +555,7 @@ func mcpGetTag(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult,
 	if tag == nil {
 		return mcp.NewToolResultError("tag not found"), nil
 	}
-	return jsonToolResultWithIndent(tagOutput{UUID: tag.UUID, Title: tag.Title, Shorthand: tag.ShortHand}, true), nil
+	return jsonToolResultWithIndent(formatTag(tag), true), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,7 +1046,7 @@ func countStatus(checks []smokeCheck, status string) int {
 const (
 	mcpServerName    = "Things Cloud"
 	mcpServerTitle   = "Things Cloud (Things 3)"
-	mcpServerVersion = "1.3.0"
+	mcpServerVersion = "1.3.1"
 )
 
 const mcpServerInstructions = `Read/write access to a Things 3 account via Things Cloud sync.
@@ -1036,7 +1056,8 @@ Conventions:
 - 'when' controls scheduling (today, anytime, someday, inbox, or YYYY-MM-DD; a future date lands in Upcoming). 'deadline' is a hard due date — only set it when the user explicitly asks for one.
 - Checklist items are lightweight checkboxes inside a task. Subtasks are full tasks created via things_create_task with parent_task.
 - 'reminder' ("HH:MM", 24h) sets a notification time and needs a dated 'when' (today or YYYY-MM-DD); dropping the date drops the reminder.
-- Headings live inside projects; assign tasks to one via the 'heading' parameter on create/edit.
+- Headings live inside projects; assign tasks to one via the 'heading' parameter on create/edit. things_list_project_tasks returns headings alongside tasks, and each task's heading_id shows where it sits.
+- In task output, project_id holds the direct parent: a project UUID, or the parent task's UUID for subtasks.
 - Trashing a task is reversible (things_untrash_task). Purging a task and deleting a checklist item are PERMANENT — prefer trash unless the user explicitly wants permanent deletion.
 - things_cancel_task logs a task as "won't do"; things_uncomplete_task reopens completed or canceled tasks.
 - things_smoke_test writes to the real account (it creates, edits, completes, and trashes a "[smoke-test]" task); run it only as a diagnostic.
@@ -1180,7 +1201,7 @@ func newMCPHandler() http.Handler {
 	), mcpListAllTasks)
 
 	s.AddTool(mcp.NewTool("things_list_project_tasks",
-		mcp.WithDescription("List tasks in a specific Things project"),
+		mcp.WithDescription("List the contents of a Things project: its tasks and its headings (type 'heading'). Tasks under a heading carry that heading's UUID in heading_id."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("project_uuid",
 			mcp.Required(),

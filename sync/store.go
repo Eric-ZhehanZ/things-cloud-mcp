@@ -252,6 +252,10 @@ func (s *Syncer) getArea(uuid string) (*things.Area, error) {
 		return nil, err
 	}
 
+	if a.TagIDs, err = s.loadAreaTagIDs(a.UUID); err != nil {
+		return nil, err
+	}
+
 	return &a, nil
 }
 
@@ -261,7 +265,39 @@ func (s *Syncer) saveArea(a *things.Area) error {
 		INSERT OR REPLACE INTO areas (uuid, title, deleted)
 		VALUES (?, ?, 0)
 	`, a.UUID, a.Title)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Delete and re-insert area_tags entries
+	if _, err := s.db.Exec(`DELETE FROM area_tags WHERE area_uuid = ?`, a.UUID); err != nil {
+		return err
+	}
+	for _, tagID := range a.TagIDs {
+		if _, err := s.db.Exec(`INSERT INTO area_tags (area_uuid, tag_uuid) VALUES (?, ?)`, a.UUID, tagID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadAreaTagIDs returns the tag UUIDs attached to an area.
+func (s *Syncer) loadAreaTagIDs(uuid string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT tag_uuid FROM area_tags WHERE area_uuid = ?`, uuid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tagIDs []string
+	for rows.Next() {
+		var tagUUID string
+		if err := rows.Scan(&tagUUID); err != nil {
+			return nil, err
+		}
+		tagIDs = append(tagIDs, tagUUID)
+	}
+	return tagIDs, rows.Err()
 }
 
 // markAreaDeleted soft-deletes an area by setting its deleted flag to 1.

@@ -108,6 +108,17 @@ func (st *State) AllAreasWithOpts(opts QueryOpts) ([]*things.Area, error) {
 		}
 		areas = append(areas, &a)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	readSyncer := st.syncer.readSyncer()
+	for _, a := range areas {
+		var err error
+		if a.TagIDs, err = readSyncer.loadAreaTagIDs(a.UUID); err != nil {
+			return nil, err
+		}
+	}
 	return areas, nil
 }
 
@@ -121,7 +132,7 @@ func (st *State) AllTagsWithOpts(opts QueryOpts) ([]*things.Tag, error) {
 	st.syncer.mu.RLock()
 	defer st.syncer.mu.RUnlock()
 
-	query := `SELECT uuid, title, shortcut FROM tags WHERE deleted = 0 ORDER BY "index"`
+	query := `SELECT uuid, title, shortcut, parent_uuid FROM tags WHERE deleted = 0 ORDER BY "index"`
 	args := []any{}
 	query, args = paginateQuery(query, args, opts)
 
@@ -134,8 +145,12 @@ func (st *State) AllTagsWithOpts(opts QueryOpts) ([]*things.Tag, error) {
 	var tags []*things.Tag
 	for rows.Next() {
 		var t things.Tag
-		if err := rows.Scan(&t.UUID, &t.Title, &t.ShortHand); err != nil {
+		var parentUUID sql.NullString
+		if err := rows.Scan(&t.UUID, &t.Title, &t.ShortHand, &parentUUID); err != nil {
 			return nil, err
+		}
+		if parentUUID.Valid && parentUUID.String != "" {
+			t.ParentTagIDs = []string{parentUUID.String}
 		}
 		tags = append(tags, &t)
 	}
@@ -256,9 +271,11 @@ func (st *State) TasksInUpcoming(opts QueryOpts) ([]*things.Task, error) {
 	return st.queryTasks(query, args...)
 }
 
-// TasksInProject returns tasks belonging to a project
+// TasksInProject returns the contents of a project: its tasks and its
+// headings (type 2). Headings are included so callers can discover their
+// UUIDs and correlate tasks' heading assignments.
 func (st *State) TasksInProject(projectUUID string, opts QueryOpts) ([]*things.Task, error) {
-	query := `SELECT uuid FROM tasks WHERE type = 0 AND project_uuid = ? AND deleted = 0`
+	query := `SELECT uuid FROM tasks WHERE type IN (0, 2) AND project_uuid = ? AND deleted = 0`
 	args := []any{projectUUID}
 	if !opts.IncludeCompleted {
 		query += " AND status != 3"
