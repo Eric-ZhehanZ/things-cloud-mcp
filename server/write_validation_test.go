@@ -71,7 +71,7 @@ func TestWriteOpsRejectUnknownTargets(t *testing.T) {
 	t.Run("uncomplete unknown task", func(t *testing.T) { expectNotFound(t, uncompleteTask(missingUUID)) })
 	t.Run("trash unknown task", func(t *testing.T) { expectNotFound(t, trashTask(missingUUID)) })
 	t.Run("untrash unknown task", func(t *testing.T) { expectNotFound(t, untrashTask(missingUUID)) })
-	t.Run("move unknown task to today", func(t *testing.T) { expectNotFound(t, moveTaskToToday(missingUUID)) })
+	t.Run("move unknown task to today", func(t *testing.T) { expectNotFound(t, moveTaskToToday(missingUUID, "")) })
 	t.Run("move unknown task to anytime", func(t *testing.T) { expectNotFound(t, moveTaskToAnytime(missingUUID)) })
 	t.Run("move unknown task to someday", func(t *testing.T) { expectNotFound(t, moveTaskToSomeday(missingUUID)) })
 	t.Run("move unknown task to inbox", func(t *testing.T) { expectNotFound(t, moveTaskToInbox(missingUUID)) })
@@ -112,7 +112,7 @@ func TestWriteOpsRejectUnknownTargets(t *testing.T) {
 		expectNotFound(t, err)
 	})
 	t.Run("create project in unknown area", func(t *testing.T) {
-		_, err := createProject("x", "", "", "", missingUUID)
+		_, err := createProject("x", "", "", "", missingUUID, "")
 		expectNotFound(t, err)
 	})
 	t.Run("create checklist item on unknown task", func(t *testing.T) {
@@ -152,7 +152,7 @@ func TestBuildEditUpdateSchedulePreservation(t *testing.T) {
 	inbox := &thingscloud.Task{UUID: testTaskUUID, Schedule: thingscloud.TaskScheduleInbox}
 
 	t.Run("project move keeps existing schedule", func(t *testing.T) {
-		fields, err := buildEditUpdate(EditTaskRequest{UUID: testTaskUUID, Project: testProjectUUID}, scheduled)
+		fields, err := buildEditUpdate(EditTaskRequest{UUID: testTaskUUID, Project: testProjectUUID}, scheduled, time.UTC)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -165,7 +165,7 @@ func TestBuildEditUpdateSchedulePreservation(t *testing.T) {
 	})
 
 	t.Run("project move out of inbox forces anytime", func(t *testing.T) {
-		fields, err := buildEditUpdate(EditTaskRequest{UUID: testTaskUUID, Project: testProjectUUID}, inbox)
+		fields, err := buildEditUpdate(EditTaskRequest{UUID: testTaskUUID, Project: testProjectUUID}, inbox, time.UTC)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -175,7 +175,7 @@ func TestBuildEditUpdateSchedulePreservation(t *testing.T) {
 	})
 
 	t.Run("explicit when wins over preservation", func(t *testing.T) {
-		fields, err := buildEditUpdate(EditTaskRequest{UUID: testTaskUUID, Project: testProjectUUID, When: "someday"}, scheduled)
+		fields, err := buildEditUpdate(EditTaskRequest{UUID: testTaskUUID, Project: testProjectUUID, When: "someday"}, scheduled, time.UTC)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -185,7 +185,7 @@ func TestBuildEditUpdateSchedulePreservation(t *testing.T) {
 	})
 
 	t.Run("project none clears project", func(t *testing.T) {
-		fields, err := buildEditUpdate(EditTaskRequest{UUID: testTaskUUID, Project: "none"}, scheduled)
+		fields, err := buildEditUpdate(EditTaskRequest{UUID: testTaskUUID, Project: "none"}, scheduled, time.UTC)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -199,7 +199,7 @@ func TestBuildEditUpdateSchedulePreservation(t *testing.T) {
 	})
 
 	t.Run("repeat on inbox task without when forces anytime", func(t *testing.T) {
-		fields, err := buildEditUpdate(EditTaskRequest{UUID: testTaskUUID, Repeat: "daily"}, inbox)
+		fields, err := buildEditUpdate(EditTaskRequest{UUID: testTaskUUID, Repeat: "daily"}, inbox, time.UTC)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -209,7 +209,7 @@ func TestBuildEditUpdateSchedulePreservation(t *testing.T) {
 	})
 
 	t.Run("repeat on scheduled task keeps schedule", func(t *testing.T) {
-		fields, err := buildEditUpdate(EditTaskRequest{UUID: testTaskUUID, Repeat: "daily"}, scheduled)
+		fields, err := buildEditUpdate(EditTaskRequest{UUID: testTaskUUID, Repeat: "daily"}, scheduled, time.UTC)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -341,7 +341,7 @@ func TestCreateOpsTreatNoneAsUnset(t *testing.T) {
 	})
 
 	t.Run("project area none", func(t *testing.T) {
-		if _, err := createProject("p", "", "", "", "none"); err != nil {
+		if _, err := createProject("p", "", "", "", "none", ""); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		payload := lastEnvelope(t, envs).payload.(taskCreatePayload)
@@ -385,5 +385,33 @@ func TestCompleteTaskWritesUpdateEnvelope(t *testing.T) {
 	fields := env.payload.(map[string]any)
 	if fields["ss"] != 3 {
 		t.Fatalf("complete should set ss=3, got %v", fields["ss"])
+	}
+}
+
+func TestGenerateUUIDCanonicalLength(t *testing.T) {
+	t.Parallel()
+	for i := 0; i < 1000; i++ {
+		id := generateUUID()
+		if len(id) != 22 {
+			t.Fatalf("generateUUID must emit exactly 22 chars, got %d: %q", len(id), id)
+		}
+		if !isBase58UUID(id) {
+			t.Fatalf("generateUUID emitted an id our own validator rejects: %q", id)
+		}
+	}
+}
+
+func TestBase58UUIDRejectsAppIndecodableLengths(t *testing.T) {
+	t.Parallel()
+	// The Things app's Base58 decoder hard-crashes on identifiers longer than
+	// 22 chars; the validator must never let them through.
+	if isBase58UUID(strings.Repeat("A", 23)) {
+		t.Fatal("23-char identifier must be rejected")
+	}
+	if isBase58UUID(strings.Repeat("A", 32)) {
+		t.Fatal("32-char identifier must be rejected")
+	}
+	if !isBase58UUID(strings.Repeat("A", 22)) {
+		t.Fatal("22-char identifier must be accepted")
 	}
 }
