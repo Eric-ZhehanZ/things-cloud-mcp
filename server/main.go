@@ -419,6 +419,7 @@ func main() {
 	if dbPath == "" {
 		dbPath = "/data/things.db"
 	}
+	thingsDBPath = dbPath
 	syncer, err = sync.Open(dbPath, client)
 	if err != nil {
 		log.Fatalf("failed to open sync database: %v", err)
@@ -613,6 +614,18 @@ func main() {
 		})
 	}))
 
+	// Backups: signed-link (or API key) downloads, an API-key listing, and
+	// scheduled snapshots.
+	http.HandleFunc("/api/backups/download", handleBackupDownload)
+	http.HandleFunc("/api/backups", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		all, err := listBackups()
+		if err != nil {
+			jsonError(w, err.Error(), 500)
+			return
+		}
+		jsonResponse(w, all)
+	}))
+
 	// MCP endpoint — protected by API_KEY when set (bearer header or ?key= query param)
 	http.Handle("/mcp", mcpAuthMiddleware(limitRequestBody(maxJSONBodyBytes, newMCPHandler())))
 
@@ -632,6 +645,7 @@ func main() {
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	startBackupScheduler(shutdownCtx)
 	server := &http.Server{Addr: ":" + port}
 
 	log.Printf("Calendar days ('today', deadlines) resolve in timezone %s — set THINGS_TIMEZONE to change", thingsLocation())

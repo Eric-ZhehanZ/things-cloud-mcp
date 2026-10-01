@@ -88,6 +88,12 @@ func openDAVStore(path string) (*davStore, error) {
 
 func (s *davStore) Close() error { return s.db.Close() }
 
+// backupTo writes a consistent copy of the store to path.
+func (s *davStore) backupTo(path string) error {
+	_, err := s.db.Exec(`VACUUM INTO ?`, path)
+	return err
+}
+
 // recordServed stores each delivered object's fields as the device's base.
 func (s *davStore) recordServed(device string, objs []*thingsdav.Object) error {
 	if len(objs) == 0 {

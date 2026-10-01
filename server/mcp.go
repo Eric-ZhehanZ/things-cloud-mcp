@@ -1068,6 +1068,7 @@ Conventions:
 - things_cancel_task logs a task as "won't do"; things_uncomplete_task reopens completed or canceled tasks.
 - things_smoke_test writes to the real account (it creates, edits, completes, and trashes a "[smoke-test]" task); run it only as a diagnostic.
 - Reads sync from Things Cloud on demand, throttled to at most one sync every few seconds; reads immediately after a write are already fresh.
+- things_backup_create snapshots the database (or rebuilds a past moment with as_of) and returns a short-lived download link; things_backup_list lists stored backups with fresh links. Automatic snapshots are taken daily.
 - Calendar days ('today', deadline validation, repeat anchors) resolve in a timezone. Pass the user's IANA timezone via the 'timezone' parameter on create/edit/move-to-today whenever you know it; otherwise the server falls back to its THINGS_TIMEZONE setting, then UTC. If "today" lands on the wrong day, the timezone is wrong — pass it explicitly or use a YYYY-MM-DD date.`
 
 func newMCPHandler() http.Handler {
@@ -1626,6 +1627,21 @@ func newMCPHandler() http.Handler {
 	), mcpDeleteChecklistItem)
 
 	// --- Diagnostic tools ---
+
+	s.AddTool(mcp.NewTool("things_backup_create",
+		mcp.WithDescription("Back up the Things database and return a download link (valid 15 minutes) to a zip of SQLite files. Without as_of: a consistent snapshot of the current data (Things mirror plus the CalDAV store). With as_of: Things as it stood at that moment, rebuilt from Things Cloud history (as far back as that history goes)."),
+		mcp.WithString("as_of",
+			mcp.Description("Optional past moment to rebuild: YYYY-MM-DD (end of that day) or RFC 3339"),
+		),
+		mcp.WithString("timezone",
+			mcp.Description("IANA timezone for a YYYY-MM-DD as_of; defaults to THINGS_TIMEZONE"),
+		),
+	), mcpBackupCreate)
+
+	s.AddTool(mcp.NewTool("things_backup_list",
+		mcp.WithDescription("List stored backups (manual snapshots, automatic daily snapshots, and point-in-time rebuilds), newest first, each with a fresh 15-minute download link."),
+		mcp.WithReadOnlyHintAnnotation(true),
+	), mcpBackupList)
 
 	s.AddTool(mcp.NewTool("things_smoke_test",
 		mcp.WithDescription("Run a smoke test that creates a task, verifies read/edit/complete, then cleans up. Returns pass/fail results for each check."),
