@@ -3,7 +3,7 @@ package main
 // CalDAV endpoint (/dav/, /.well-known/caldav): exposes Things as task lists
 // plus a Deadlines event calendar for BusyCal. Rendering lives in the
 // thingsdav package; this file wires it to go-webdav, Basic auth and the
-// shared sync throttle. Phase 2 is read-only: writes are refused with 403.
+// shared sync throttle. Writes live in dav_write.go.
 
 import (
 	"context"
@@ -16,6 +16,7 @@ import (
 	"strings"
 	gosync "sync"
 	"time"
+	_ "time/tzdata" // the Alpine image has no zoneinfo; BusyCal sends TZIDs
 
 	"github.com/emersion/go-ical"
 	"github.com/emersion/go-webdav"
@@ -67,7 +68,7 @@ func davAuth(password string, next http.Handler) http.Handler {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), davDeviceKey, strings.ToLower(user))))
 	})
 }
 
@@ -80,6 +81,7 @@ func davAuth(password string, next http.Handler) http.Handler {
 // when the window setting changes.
 type davViewKey struct {
 	serverIndex   int
+	generation    int64
 	utcDay        string
 	completedDays int
 }
@@ -99,6 +101,7 @@ var loadDAVView = func() (*thingsdav.View, error) {
 	now := time.Now()
 	key := davViewKey{
 		serverIndex:   syncer.LastSyncedIndex(),
+		generation:    davGeneration.Load(),
 		utcDay:        now.UTC().Format("2006-01-02"),
 		completedDays: davCompletedDays(),
 	}
@@ -130,7 +133,11 @@ var loadDAVView = func() (*thingsdav.View, error) {
 func davInput(st *sync.State, now time.Time, completedDays int) (thingsdav.Input, error) {
 	in := thingsdav.Input{
 		Now:             now,
-		SomedayCategory: os.Getenv("CALDAV_SOMEDAY_CATEGORY"),
+		SomedayCategory: davSomedayCategory(),
+		Location:        thingsLocation(),
+	}
+	if err := davStoreInput(&in); err != nil {
+		return in, err
 	}
 	open, err := st.AllTasks(sync.QueryOpts{})
 	if err != nil {
@@ -173,6 +180,39 @@ func davInput(st *sync.State, now time.Time, completedDays int) (thingsdav.Input
 		return t
 	}
 	return in, nil
+}
+
+// davStoreInput wires the CalDAV store's aliases and sidecars into a
+// render.
+func davStoreInput(in *thingsdav.Input) error {
+	if davDB == nil {
+		return nil
+	}
+	aliases, err := davDB.aliases()
+	if err != nil {
+		return fmt.Errorf("load aliases: %w", err)
+	}
+	sidecars, err := davDB.sidecars()
+	if err != nil {
+		return fmt.Errorf("load sidecars: %w", err)
+	}
+	in.Alias = func(uuid string) (string, string, bool) {
+		a, ok := aliases[uuid]
+		return a.uid, a.name, ok
+	}
+	in.Extras = func(uuid string) *ical.Calendar {
+		raw, ok := sidecars[uuid]
+		if !ok {
+			return nil
+		}
+		cal, err := thingsdav.DecodeExtras(raw)
+		if err != nil {
+			logDAV("bad sidecar for %s: %v", uuid, err)
+			return nil
+		}
+		return cal
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -275,44 +315,63 @@ func (davBackend) GetCalendarObject(ctx context.Context, p string, req *caldav.C
 	if o == nil {
 		return nil, davNotFound("object %s not found", p)
 	}
+	davRecordServed(ctx, o)
 	co := toDAVObject(calID, o)
 	return &co, nil
 }
 
-func (davBackend) ListCalendarObjects(ctx context.Context, p string, req *caldav.CalendarCompRequest) ([]caldav.CalendarObject, error) {
+// davCalendarObjects returns the rendered objects of the calendar at p.
+func davCalendarObjects(p string) (string, []*thingsdav.Object, error) {
 	calID, _, ok := davSplitPath(p)
 	if !ok {
-		return nil, davNotFound("calendar %s not found", p)
+		return "", nil, davNotFound("calendar %s not found", p)
 	}
 	view, err := loadDAVView()
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	c := view.Calendar(calID)
 	if c == nil {
-		return nil, davNotFound("calendar %s not found", p)
+		return "", nil, davNotFound("calendar %s not found", p)
 	}
-	out := make([]caldav.CalendarObject, 0, len(c.Objects))
-	for _, o := range c.Objects {
+	return calID, c.Objects, nil
+}
+
+func (davBackend) ListCalendarObjects(ctx context.Context, p string, req *caldav.CalendarCompRequest) ([]caldav.CalendarObject, error) {
+	calID, objs, err := davCalendarObjects(p)
+	if err != nil {
+		return nil, err
+	}
+	davRecordServed(ctx, objs...)
+	out := make([]caldav.CalendarObject, 0, len(objs))
+	for _, o := range objs {
 		out = append(out, toDAVObject(calID, o))
 	}
 	return out, nil
 }
 
-func (b davBackend) QueryCalendarObjects(ctx context.Context, p string, query *caldav.CalendarQuery) ([]caldav.CalendarObject, error) {
-	all, err := b.ListCalendarObjects(ctx, p, &query.CompRequest)
+func (davBackend) QueryCalendarObjects(ctx context.Context, p string, query *caldav.CalendarQuery) ([]caldav.CalendarObject, error) {
+	calID, objs, err := davCalendarObjects(p)
 	if err != nil {
 		return nil, err
 	}
-	return caldav.Filter(query, all)
-}
-
-func (davBackend) PutCalendarObject(ctx context.Context, p string, cal *ical.Calendar, opts *caldav.PutCalendarObjectOptions) (*caldav.CalendarObject, error) {
-	return nil, errDAVReadOnly
-}
-
-func (davBackend) DeleteCalendarObject(ctx context.Context, p string) error {
-	return errDAVReadOnly
+	all := make([]caldav.CalendarObject, 0, len(objs))
+	byPath := make(map[string]*thingsdav.Object, len(objs))
+	for _, o := range objs {
+		co := toDAVObject(calID, o)
+		all = append(all, co)
+		byPath[co.Path] = o
+	}
+	matched, err := caldav.Filter(query, all)
+	if err != nil {
+		return nil, err
+	}
+	served := make([]*thingsdav.Object, 0, len(matched))
+	for _, co := range matched {
+		served = append(served, byPath[co.Path])
+	}
+	davRecordServed(ctx, served...)
+	return matched, nil
 }
 
 // newDAVHandler returns the authenticated CalDAV handler, or nil when no
@@ -323,5 +382,5 @@ func newDAVHandler() http.Handler {
 		return nil
 	}
 	h := &caldav.Handler{Backend: davBackend{}, Prefix: davPrefix}
-	return davAuth(password, limitRequestBody(maxJSONBodyBytes, davCalendarProps(h)))
+	return davAuth(password, limitRequestBody(maxJSONBodyBytes, davMarkDelivery(davCalendarProps(h))))
 }

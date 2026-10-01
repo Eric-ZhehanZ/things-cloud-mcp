@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -68,17 +69,38 @@ type Input struct {
 	// means no limit.
 	CompletedSince  time.Time
 	SomedayCategory string
+	// Location resolves client times without a TZID and anchors relative
+	// alarms on all-day dates. Defaults to UTC.
+	Location *time.Location
+	// Extras returns a task's sidecar (client properties Things can't hold),
+	// or nil.
+	Extras func(uuid string) *ical.Calendar
+	// Alias returns the UID and file name a client created a task under,
+	// when they differ from the Things UUID.
+	Alias func(uuid string) (uid, name string, ok bool)
 }
 
 // Object is one rendered calendar resource.
 type Object struct {
-	Name    string // file name within the calendar, e.g. "<uuid>.ics"
-	UID     string
-	Data    *ical.Calendar
-	Raw     []byte
-	ETag    string
-	ModTime time.Time
+	Name     string // file name within the calendar, e.g. "<uuid>.ics"
+	UID      string
+	Key      string // TaskKey or DeadlineKey: identifies merge snapshots
+	TaskUUID string // the Things task or project behind the object
+	Title    string
+	Created  time.Time // CREATED as rendered (second precision)
+	// Snapshot is the JSON of the object's TaskFields or DeadlineFields:
+	// recorded per device when the object is downloaded, it becomes the base
+	// of that device's next edit.
+	Snapshot string
+	Data     *ical.Calendar
+	Raw      []byte
+	ETag     string
+	ModTime  time.Time
 }
+
+// TaskKey and DeadlineKey name an object's merge snapshots.
+func TaskKey(uuid string) string     { return "task:" + uuid }
+func DeadlineKey(uuid string) string { return "deadline:" + uuid }
 
 // Calendar colors (Apple calendar-color, #RRGGBBAA): Inbox and loose tasks
 // are blue, every area and project shares one gray, Deadlines is red.
@@ -121,6 +143,15 @@ func Build(in Input) (*View, error) {
 	}
 	if in.Lookup == nil {
 		in.Lookup = func(string) *things.Task { return nil }
+	}
+	if in.Location == nil {
+		in.Location = time.UTC
+	}
+	if in.Extras == nil {
+		in.Extras = func(string) *ical.Calendar { return nil }
+	}
+	if in.Alias == nil {
+		in.Alias = func(string) (string, string, bool) { return "", "", false }
 	}
 	b := &builder{in: in, view: &View{byID: map[string]*Calendar{}}}
 
@@ -165,18 +196,25 @@ func Build(in Input) (*View, error) {
 		if cal == nil {
 			continue // parent project hidden (trashed or completed long ago)
 		}
-		if err := b.addObject(cal, t.UUID, b.renderTodo(t), modTime(t)); err != nil {
+		f := FieldsFromTask(t, in.Tags, in.SomedayCategory, in.Now)
+		uid, name := t.UUID, t.UUID+".ics"
+		if u, n, ok := in.Alias(t.UUID); ok {
+			uid, name = u, n
+		}
+		o := &Object{Name: name, UID: uid, Key: TaskKey(t.UUID), TaskUUID: t.UUID, Title: t.Title,
+			Created: t.CreationDate.UTC().Truncate(time.Second), ModTime: modTime(t)}
+		if err := b.addObject(cal, o, b.renderTodo(t, f, uid), f); err != nil {
 			return nil, err
 		}
 		if t.Status == things.TaskStatusPending && t.DeadlineDate != nil {
-			if err := b.addObject(deadlines, "deadline-"+t.UUID, b.renderDeadline(t), modTime(t)); err != nil {
+			if err := b.addDeadline(deadlines, t); err != nil {
 				return nil, err
 			}
 		}
 	}
 	for _, p := range in.Projects {
 		if p.Status == things.TaskStatusPending && !p.InTrash && p.DeadlineDate != nil {
-			if err := b.addObject(deadlines, "deadline-"+p.UUID, b.renderDeadline(p), modTime(p)); err != nil {
+			if err := b.addDeadline(deadlines, p); err != nil {
 				return nil, err
 			}
 		}
@@ -205,27 +243,35 @@ func (b *builder) addCalendar(id, name string, kind Kind, color string) *Calenda
 	return c
 }
 
-func (b *builder) addObject(c *Calendar, uid string, comp *ical.Component, mod time.Time) error {
-	cal := ical.NewCalendar()
-	cal.Props.SetText(ical.PropVersion, "2.0")
-	cal.Props.SetText(ical.PropProductID, prodID)
-	cal.Children = append(cal.Children, comp)
+func (b *builder) addObject(c *Calendar, o *Object, cal *ical.Calendar, snapshot any) error {
 	var buf bytes.Buffer
 	if err := ical.NewEncoder(&buf).Encode(cal); err != nil {
-		return fmt.Errorf("render %s: %w", uid, err)
+		return fmt.Errorf("render %s: %w", o.UID, err)
+	}
+	snap, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
 	}
 	sum := sha256.Sum256(buf.Bytes())
-	o := &Object{
-		Name:    uid + ".ics",
-		UID:     uid,
-		Data:    cal,
-		Raw:     buf.Bytes(),
-		ETag:    hex.EncodeToString(sum[:16]),
-		ModTime: mod,
-	}
+	o.Data, o.Raw, o.ETag, o.Snapshot = cal, buf.Bytes(), hex.EncodeToString(sum[:16]), string(snap)
 	c.Objects = append(c.Objects, o)
 	c.byName[o.Name] = o
 	return nil
+}
+
+func (b *builder) addDeadline(c *Calendar, t *things.Task) error {
+	uid := "deadline-" + t.UUID
+	o := &Object{Name: uid + ".ics", UID: uid, Key: DeadlineKey(t.UUID), TaskUUID: t.UUID, Title: t.Title,
+		Created: t.CreationDate.UTC().Truncate(time.Second), ModTime: modTime(t)}
+	return b.addObject(c, o, wrapCalendar(b.renderDeadline(t, uid)), DeadlineFromTask(t))
+}
+
+func wrapCalendar(comps ...*ical.Component) *ical.Calendar {
+	cal := ical.NewCalendar()
+	cal.Props.SetText(ical.PropVersion, "2.0")
+	cal.Props.SetText(ical.PropProductID, prodID)
+	cal.Children = append(cal.Children, comps...)
+	return cal
 }
 
 // projectVisible reports whether a project gets a calendar: open projects
@@ -274,35 +320,57 @@ func (b *builder) containerID(t *things.Task) string {
 	return NoProjectID
 }
 
-// whenDate is the Things When date: sr, or tir when it marks today.
-func (b *builder) whenDate(t *things.Task) *time.Time {
-	if t.ScheduledDate != nil {
-		return t.ScheduledDate
-	}
-	if t.Schedule == things.TaskScheduleAnytime && t.TodayIndexReference != nil &&
-		sameUTCDay(*t.TodayIndexReference, b.in.Now) {
-		return t.TodayIndexReference
-	}
-	return nil
-}
-
-func (b *builder) renderTodo(t *things.Task) *ical.Component {
+func (b *builder) renderTodo(t *things.Task, f TaskFields, uid string) *ical.Calendar {
 	c := ical.NewComponent(ical.CompToDo)
-	c.Props.SetText(ical.PropUID, t.UUID)
-	c.Props.SetText(ical.PropSummary, t.Title)
-	if t.Note != "" {
-		c.Props.SetText(ical.PropDescription, t.Note)
+	c.Props.SetText(ical.PropUID, uid)
+	c.Props.SetText(ical.PropSummary, f.Title)
+	if f.Notes != "" {
+		c.Props.SetText(ical.PropDescription, f.Notes)
 	}
 	setTimestamps(c, t)
 
-	when := b.whenDate(t)
-	if when != nil {
-		c.Props.SetDate(ical.PropDateTimeStart, dateOnly(*when))
-		c.Props.SetDate(ical.PropDue, dateOnly(*when))
+	var xtodo *ical.Component
+	var timezones []*ical.Component
+	if extras := b.in.Extras(t.UUID); extras != nil {
+		xtodo = firstChild(extras.Component, ical.CompToDo)
+		for _, child := range extras.Children {
+			if child.Name == ical.CompTimezone {
+				timezones = append(timezones, child)
+			}
+		}
 	}
 
-	switch t.Status {
-	case things.TaskStatusCompleted:
+	// Date, at the client's time of day when it set one.
+	var start time.Time
+	timed := false
+	if f.When != "" {
+		d, _ := time.Parse(dateLayout, f.When)
+		start = time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, b.in.Location)
+		if xtodo != nil {
+			if tp := xtodo.Props.Get(propTime); tp != nil {
+				if clock, err := time.Parse("150405", tp.Value); err == nil {
+					zone := b.in.Location
+					if tzid := tp.Params.Get(ical.PropTimezoneID); tzid != "" {
+						if l, err := time.LoadLocation(tzid); err == nil {
+							zone = l
+						}
+					}
+					start = time.Date(d.Year(), d.Month(), d.Day(), clock.Hour(), clock.Minute(), clock.Second(), 0, zone)
+					timed = true
+				}
+			}
+		}
+		if timed {
+			c.Props.SetDateTime(ical.PropDateTimeStart, start)
+			c.Props.SetDateTime(ical.PropDue, start)
+		} else {
+			c.Props.SetDate(ical.PropDateTimeStart, d)
+			c.Props.SetDate(ical.PropDue, d)
+		}
+	}
+
+	switch f.Status {
+	case StatusCompleted:
 		c.Props.SetText(ical.PropStatus, "COMPLETED")
 		if t.CompletionDate != nil {
 			c.Props.SetDateTime(ical.PropCompleted, t.CompletionDate.UTC())
@@ -311,14 +379,14 @@ func (b *builder) renderTodo(t *things.Task) *ical.Component {
 		pct.SetValueType(ical.ValueInt)
 		pct.Value = "100"
 		c.Props.Set(pct)
-	case things.TaskStatusCanceled:
+	case StatusCanceled:
 		c.Props.SetText(ical.PropStatus, "CANCELLED")
 	default:
 		c.Props.SetText(ical.PropStatus, "NEEDS-ACTION")
 	}
 
-	cats := b.tagTitles(t.TagIDs)
-	if when == nil && t.Schedule == things.TaskScheduleSomeday {
+	cats := f.TagList()
+	if f.Someday {
 		cats = append(cats, b.in.SomedayCategory)
 	}
 	if len(cats) > 0 {
@@ -327,22 +395,69 @@ func (b *builder) renderTodo(t *things.Task) *ical.Component {
 		c.Props.Set(p)
 	}
 
-	if when != nil && t.AlarmTimeOffset != nil && *t.AlarmTimeOffset >= 0 {
-		alarm := ical.NewComponent(ical.CompAlarm)
-		alarm.Props.SetText(ical.PropAction, "DISPLAY")
-		alarm.Props.SetText(ical.PropDescription, t.Title)
-		trigger := ical.NewProp(ical.PropTrigger)
-		trigger.SetValueType(ical.ValueDuration)
-		trigger.Value = offsetDuration(*t.AlarmTimeOffset)
-		alarm.Props.Set(trigger)
-		c.Children = append(c.Children, alarm)
+	// Client extras: unmapped properties, sub-components and alarms. The
+	// alarm that carried the reminder is reused verbatim while the Things
+	// reminder still matches it, so the client's sound and settings survive.
+	var reminderAlarm *ical.Component
+	if xtodo != nil {
+		for name, props := range xtodo.Props {
+			if ownedTodoProps[name] || strings.HasPrefix(name, "X-THINGSDAV-") {
+				continue
+			}
+			c.Props[name] = append([]ical.Prop(nil), props...)
+		}
+		for _, child := range xtodo.Children {
+			if child.Name != ical.CompAlarm {
+				c.Children = append(c.Children, cloneComponent(child))
+				continue
+			}
+			alarm := cloneComponent(child)
+			if propText(alarm, propAlarmRole) == roleReminder {
+				alarm.Props.Del(propAlarmRole)
+				reminderAlarm = alarm
+				continue
+			}
+			trig := alarm.Props.Get(ical.PropTrigger)
+			if f.When == "" && (trig == nil || trig.ValueType() != ical.ValueDateTime) {
+				continue // a relative alarm needs a date to hang off
+			}
+			c.Children = append(c.Children, alarm)
+		}
 	}
-	return c
+	if f.When != "" && f.Reminder != NoReminder {
+		c.Children = append(c.Children, b.reminderAlarm(f, start, reminderAlarm))
+	}
+	return wrapCalendar(append(timezonesIf(timed, timezones), c)...)
 }
 
-func (b *builder) renderDeadline(t *things.Task) *ical.Component {
+// reminderAlarm returns the client's own reminder alarm while it still
+// matches the Things reminder, else a fresh one relative to start.
+func (b *builder) reminderAlarm(f TaskFields, start time.Time, clientAlarm *ical.Component) *ical.Component {
+	if clientAlarm != nil {
+		if secs, ok := alarmSecondsOnDay(clientAlarm, start, f.When, b.in.Location); ok && secs == f.Reminder {
+			return clientAlarm
+		}
+	}
+	alarm := ical.NewComponent(ical.CompAlarm)
+	alarm.Props.SetText(ical.PropAction, "DISPLAY")
+	alarm.Props.SetText(ical.PropDescription, f.Title)
+	trigger := ical.NewProp(ical.PropTrigger)
+	trigger.SetValueType(ical.ValueDuration)
+	trigger.Value = offsetDuration(f.Reminder - (start.Hour()*3600 + start.Minute()*60 + start.Second()))
+	alarm.Props.Set(trigger)
+	return alarm
+}
+
+func timezonesIf(timed bool, tzs []*ical.Component) []*ical.Component {
+	if !timed {
+		return nil
+	}
+	return append([]*ical.Component(nil), tzs...)
+}
+
+func (b *builder) renderDeadline(t *things.Task, uid string) *ical.Component {
 	c := ical.NewComponent(ical.CompEvent)
-	c.Props.SetText(ical.PropUID, "deadline-"+t.UUID)
+	c.Props.SetText(ical.PropUID, uid)
 	c.Props.SetText(ical.PropSummary, t.Title)
 	if t.Note != "" {
 		c.Props.SetText(ical.PropDescription, t.Note)
@@ -357,16 +472,6 @@ func (b *builder) renderDeadline(t *things.Task) *ical.Component {
 	url.Value = "things:///show?id=" + t.UUID
 	c.Props.Set(url)
 	return c
-}
-
-func (b *builder) tagTitles(ids []string) []string {
-	var out []string
-	for _, id := range ids {
-		if title := b.in.Tags[id]; title != "" && title != b.in.SomedayCategory {
-			out = append(out, title)
-		}
-	}
-	return out
 }
 
 // setTimestamps writes DTSTAMP/CREATED/LAST-MODIFIED from Things dates so
@@ -402,13 +507,17 @@ func sameUTCDay(a, b time.Time) bool {
 	return ay == by && am == bm && ad == bd
 }
 
-// offsetDuration formats seconds-after-midnight the way BusyCal writes
-// alarm triggers on all-day to-dos: PT9H, PT9H30M, PT0S.
+// offsetDuration formats an alarm offset the way BusyCal writes triggers:
+// PT9H, PT9H30M, PT0S, -PT15M.
 func offsetDuration(seconds int) string {
 	if seconds == 0 {
 		return "PT0S"
 	}
 	var sb strings.Builder
+	if seconds < 0 {
+		sb.WriteByte('-')
+		seconds = -seconds
+	}
 	sb.WriteString("PT")
 	if h := seconds / 3600; h > 0 {
 		fmt.Fprintf(&sb, "%dH", h)

@@ -425,6 +425,12 @@ func main() {
 	}
 	defer syncer.Close()
 
+	davDB, err = openDAVStore(davStorePath(dbPath))
+	if err != nil {
+		log.Fatalf("failed to open CalDAV store: %v", err)
+	}
+	defer davDB.Close()
+
 	if err := runInitialSync(syncer); err != nil {
 		log.Fatal(err)
 	}
@@ -614,7 +620,12 @@ func main() {
 	if dav != nil {
 		http.Handle(davPrefix+"/", dav)
 		http.Handle("/.well-known/caldav", dav)
-		log.Printf("CalDAV enabled at %s/ (read-only, %d days of completed tasks)", davPrefix, davCompletedDays())
+		http.HandleFunc("/api/dav/resume", authMiddleware(handleDAVResume))
+		mode := "read-write"
+		if os.Getenv("CALDAV_READ_ONLY") == "true" {
+			mode = "read-only"
+		}
+		log.Printf("CalDAV enabled at %s/ (%s, %d days of completed tasks)", davPrefix, mode, davCompletedDays())
 	} else {
 		log.Printf("CalDAV disabled — set CALDAV_PASSWORD or API_KEY to enable")
 	}
