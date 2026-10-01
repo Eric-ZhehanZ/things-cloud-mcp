@@ -397,8 +397,10 @@ type Setting struct{}
 // 2|visible|INTEGER|0||0
 // 3|index|INTEGER|0||0
 type Area struct {
-	UUID   string
-	Title  string
+	UUID  string
+	Title string
+	// Index is the area's sidebar position (ix); lower sorts first.
+	Index  int
 	TagIDs []string
 	Tags   []*Tag
 	Tasks  []*Task

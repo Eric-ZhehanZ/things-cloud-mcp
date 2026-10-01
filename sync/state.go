@@ -90,7 +90,7 @@ func (st *State) AllAreasWithOpts(opts QueryOpts) ([]*things.Area, error) {
 	st.syncer.mu.RLock()
 	defer st.syncer.mu.RUnlock()
 
-	query := `SELECT uuid, title FROM areas WHERE deleted = 0 ORDER BY "index"`
+	query := `SELECT uuid, title, "index" FROM areas WHERE deleted = 0 ORDER BY "index", uuid`
 	args := []any{}
 	query, args = paginateQuery(query, args, opts)
 
@@ -103,7 +103,7 @@ func (st *State) AllAreasWithOpts(opts QueryOpts) ([]*things.Area, error) {
 	var areas []*things.Area
 	for rows.Next() {
 		var a things.Area
-		if err := rows.Scan(&a.UUID, &a.Title); err != nil {
+		if err := rows.Scan(&a.UUID, &a.Title, &a.Index); err != nil {
 			return nil, err
 		}
 		areas = append(areas, &a)

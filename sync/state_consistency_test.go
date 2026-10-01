@@ -3,6 +3,7 @@ package sync
 import (
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,5 +141,57 @@ func TestAreaTagsRoundTrip(t *testing.T) {
 	}
 	if len(areas) != 1 || len(areas[0].TagIDs) != 2 {
 		t.Errorf("AllAreas tags = %v, want 1 area with 2 tags", areas)
+	}
+}
+
+// Areas must list in sidebar order (ix), which survives retitles and moves.
+func TestAreaIndexOrdering(t *testing.T) {
+	t.Parallel()
+	syncer := openTestSyncer(t)
+
+	areaItem := func(uuid string, action things.ItemAction, p map[string]any) things.Item {
+		payload, _ := json.Marshal(p)
+		return things.Item{UUID: uuid, Kind: things.ItemKindArea3, Action: action, P: payload}
+	}
+	items := []things.Item{
+		areaItem("area-c", things.ItemActionCreated, map[string]any{"tt": "Third", "ix": 30}),
+		areaItem("area-a", things.ItemActionCreated, map[string]any{"tt": "First", "ix": -10}),
+		areaItem("area-b", things.ItemActionCreated, map[string]any{"tt": "Second", "ix": 5}),
+	}
+	if _, err := syncer.processItems(items, 0); err != nil {
+		t.Fatalf("processItems failed: %v", err)
+	}
+	order := func() string {
+		t.Helper()
+		areas, err := syncer.State().AllAreas()
+		if err != nil {
+			t.Fatalf("AllAreas failed: %v", err)
+		}
+		var titles []string
+		for _, a := range areas {
+			titles = append(titles, a.Title)
+		}
+		return strings.Join(titles, ",")
+	}
+	if got := order(); got != "First,Second,Third" {
+		t.Fatalf("initial order = %s", got)
+	}
+
+	// A retitle without ix keeps the position.
+	if _, err := syncer.processItems([]things.Item{areaItem("area-a", things.ItemActionModified, map[string]any{"tt": "First!"})}, 3); err != nil {
+		t.Fatal(err)
+	}
+	if got := order(); got != "First!,Second,Third" {
+		t.Errorf("after retitle = %s", got)
+	}
+	// Dragging an area changes ix.
+	if _, err := syncer.processItems([]things.Item{areaItem("area-c", things.ItemActionModified, map[string]any{"ix": -50})}, 4); err != nil {
+		t.Fatal(err)
+	}
+	if got := order(); got != "Third,First!,Second" {
+		t.Errorf("after move = %s", got)
+	}
+	if a, _ := syncer.State().Area("area-c"); a == nil || a.Index != -50 {
+		t.Errorf("Area(area-c).Index = %+v, want -50", a)
 	}
 }

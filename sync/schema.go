@@ -1,6 +1,6 @@
 package sync
 
-const schemaVersion = 5
+const schemaVersion = 6
 
 const schema = `
 -- Schema version tracking
@@ -158,6 +158,10 @@ DELETE FROM change_log;
 DELETE FROM sync_state;
 `
 
+// migration6 invalidates the local cache so area sidebar positions (ix),
+// previously parsed but never stored, are ingested by a full resync.
+const migration6 = migration5
+
 func (s *Syncer) migrate() error {
 	// Check current version
 	var version int
@@ -194,6 +198,11 @@ func (s *Syncer) migrate() error {
 	}
 	if version < 5 {
 		if _, err := s.db.Exec(migration5); err != nil {
+			return err
+		}
+	}
+	if version < 6 {
+		if _, err := s.db.Exec(migration6); err != nil {
 			return err
 		}
 	}

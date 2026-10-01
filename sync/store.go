@@ -238,13 +238,13 @@ func (s *Syncer) markTaskDeleted(uuid string) error {
 // Returns nil, nil if the area is not found or is deleted.
 func (s *Syncer) getArea(uuid string) (*things.Area, error) {
 	row := s.db.QueryRow(`
-		SELECT uuid, title
+		SELECT uuid, title, "index"
 		FROM areas
 		WHERE uuid = ? AND deleted = 0
 	`, uuid)
 
 	var a things.Area
-	err := row.Scan(&a.UUID, &a.Title)
+	err := row.Scan(&a.UUID, &a.Title, &a.Index)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -262,9 +262,9 @@ func (s *Syncer) getArea(uuid string) (*things.Area, error) {
 // saveArea inserts or updates an area in the database.
 func (s *Syncer) saveArea(a *things.Area) error {
 	_, err := s.db.Exec(`
-		INSERT OR REPLACE INTO areas (uuid, title, deleted)
-		VALUES (?, ?, 0)
-	`, a.UUID, a.Title)
+		INSERT OR REPLACE INTO areas (uuid, title, "index", deleted)
+		VALUES (?, ?, ?, 0)
+	`, a.UUID, a.Title, a.Index)
 	if err != nil {
 		return err
 	}

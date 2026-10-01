@@ -415,7 +415,11 @@ func main() {
 	client.Debug = os.Getenv("DEBUG") == "true"
 
 	var err error
-	syncer, err = sync.Open("/data/things.db", client)
+	dbPath := os.Getenv("THINGS_DB_PATH")
+	if dbPath == "" {
+		dbPath = "/data/things.db"
+	}
+	syncer, err = sync.Open(dbPath, client)
 	if err != nil {
 		log.Fatalf("failed to open sync database: %v", err)
 	}
@@ -435,7 +439,15 @@ func main() {
 	}
 	log.Println("History ready for writes")
 
+	dav := newDAVHandler()
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// CalDAV clients (BusyCal) ask the server root for the current user
+		// principal during account discovery.
+		if r.URL.Path == "/" && r.Method == "PROPFIND" && dav != nil {
+			dav.ServeHTTP(w, r)
+			return
+		}
 		if r.URL.Path != "/" {
 			jsonError(w, "not found", 404)
 			return
@@ -597,6 +609,15 @@ func main() {
 
 	// MCP endpoint — protected by API_KEY when set (bearer header or ?key= query param)
 	http.Handle("/mcp", mcpAuthMiddleware(limitRequestBody(maxJSONBodyBytes, newMCPHandler())))
+
+	// CalDAV endpoint — Basic auth with CALDAV_PASSWORD (falls back to API_KEY)
+	if dav != nil {
+		http.Handle(davPrefix+"/", dav)
+		http.Handle("/.well-known/caldav", dav)
+		log.Printf("CalDAV enabled at %s/ (read-only, %d days of completed tasks)", davPrefix, davCompletedDays())
+	} else {
+		log.Printf("CalDAV disabled — set CALDAV_PASSWORD or API_KEY to enable")
+	}
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

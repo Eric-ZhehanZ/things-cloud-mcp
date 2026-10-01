@@ -155,12 +155,16 @@ func (s *Syncer) processAreaItem(item things.Item, serverIndex int, ts time.Time
 	if old != nil {
 		// Copy old state
 		newArea.Title = old.Title
+		newArea.Index = old.Index
 		newArea.TagIDs = old.TagIDs
 	}
 
 	// Apply payload fields
 	if payload.Title != nil {
 		newArea.Title = *payload.Title
+	}
+	if payload.IX != nil {
+		newArea.Index = *payload.IX
 	}
 	if payload.TagIDs != nil {
 		newArea.TagIDs = payload.TagIDs
