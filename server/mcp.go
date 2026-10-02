@@ -1650,5 +1650,6 @@ func newMCPHandler() http.Handler {
 	return server.NewStreamableHTTPServer(s,
 		server.WithEndpointPath("/mcp"),
 		server.WithStateLess(true),
+		server.WithHTTPContextFunc(withRequestBaseURL),
 	)
 }

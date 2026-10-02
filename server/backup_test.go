@@ -96,9 +96,9 @@ func TestBackupDownloadAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed := withDownloadURL(info, time.Now())
+	signed := withDownloadURL(info, time.Now(), "https://ai.thingsapi.com")
 	u, _ := url.Parse(signed.DownloadURL)
-	if !strings.HasSuffix(u.Path, "/api/backups/download") || strings.Contains(signed.DownloadURL, "backup-test-key") {
+	if u.Host != "ai.thingsapi.com" || u.Path != "/api/backups/download" || strings.Contains(signed.DownloadURL, "backup-test-key") {
 		t.Fatalf("download URL = %s", signed.DownloadURL)
 	}
 
@@ -173,5 +173,36 @@ func TestAutoBackupDue(t *testing.T) {
 	}
 	if !autoBackupDue(info.CreatedAt.Add(25*time.Hour), 24*time.Hour) {
 		t.Error("a backup 25 hours old is due")
+	}
+}
+
+func TestRequestBaseURL(t *testing.T) {
+	t.Setenv("PUBLIC_URL", "")
+	for _, tc := range []struct {
+		name    string
+		host    string
+		headers map[string]string
+		want    string
+	}{
+		{"direct", "ai.thingsapi.com", nil, "http://ai.thingsapi.com"},
+		{"behind a TLS proxy", "ai.thingsapi.com", map[string]string{"X-Forwarded-Proto": "https"}, "https://ai.thingsapi.com"},
+		{"forwarded host wins", "internal:8080", map[string]string{"X-Forwarded-Host": "ai.thingsapi.com", "X-Forwarded-Proto": "https"}, "https://ai.thingsapi.com"},
+		{"port kept", "localhost:8090", nil, "http://localhost:8090"},
+		{"junk host rejected", "evil.com/x@", nil, ""},
+		{"junk proto ignored", "ai.thingsapi.com", map[string]string{"X-Forwarded-Proto": "javascript"}, "http://ai.thingsapi.com"},
+	} {
+		r := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		r.Host = tc.host
+		for k, v := range tc.headers {
+			r.Header.Set(k, v)
+		}
+		if got := baseURLFrom(withRequestBaseURL(r.Context(), r)); got != tc.want {
+			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	t.Setenv("PUBLIC_URL", "https://override.example/")
+	r := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	if got := baseURLFrom(withRequestBaseURL(r.Context(), r)); got != "https://override.example" {
+		t.Errorf("PUBLIC_URL override = %q", got)
 	}
 }

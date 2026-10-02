@@ -352,25 +352,50 @@ func signBackup(id string, exp int64) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func publicBaseURL() string {
+type backupCtxKey struct{}
+
+var validHost = regexp.MustCompile(`^[A-Za-z0-9.-]+(:\d+)?$`)
+
+// requestBaseURL is the origin a request reached the server on, so links
+// point back at the same domain (e.g. ai.thingsapi.com behind a proxy).
+func requestBaseURL(r *http.Request) string {
+	host := r.Host
+	if fh := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0]); fh != "" {
+		host = fh
+	}
+	if !validHost.MatchString(host) {
+		return ""
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if fp := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); fp == "https" || fp == "http" {
+		scheme = fp
+	}
+	return scheme + "://" + host
+}
+
+// withRequestBaseURL stores the request's origin for MCP tool handlers.
+func withRequestBaseURL(ctx context.Context, r *http.Request) context.Context {
+	return context.WithValue(ctx, backupCtxKey{}, requestBaseURL(r))
+}
+
+// baseURLFrom returns PUBLIC_URL when set, else the origin of the request
+// that carried ctx.
+func baseURLFrom(ctx context.Context) string {
 	if u := os.Getenv("PUBLIC_URL"); u != "" {
 		return strings.TrimSuffix(u, "/")
 	}
-	if app := os.Getenv("FLY_APP_NAME"); app != "" {
-		return "https://" + app + ".fly.dev"
-	}
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	return "http://localhost:" + port
+	base, _ := ctx.Value(backupCtxKey{}).(string)
+	return base
 }
 
-func withDownloadURL(info *backupInfo, now time.Time) *backupInfo {
+func withDownloadURL(info *backupInfo, now time.Time, base string) *backupInfo {
 	exp := now.Add(backupLinkTTL).Truncate(time.Second)
 	out := *info
 	q := url.Values{"id": {info.ID}, "exp": {strconv.FormatInt(exp.Unix(), 10)}, "sig": {signBackup(info.ID, exp.Unix())}}
-	out.DownloadURL = publicBaseURL() + "/api/backups/download?" + q.Encode()
+	out.DownloadURL = base + "/api/backups/download?" + q.Encode()
 	out.URLExpiresAt = &exp
 	return &out
 }
@@ -438,7 +463,7 @@ func parseAsOf(raw, tz string) (*time.Time, error) {
 	return &end, nil
 }
 
-func mcpBackupCreate(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func mcpBackupCreate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	asOf, err := parseAsOf(req.GetString("as_of", ""), req.GetString("timezone", ""))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -453,10 +478,10 @@ func mcpBackupCreate(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolR
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	return jsonToolResultWithIndent(withDownloadURL(info, time.Now()), true), nil
+	return jsonToolResultWithIndent(withDownloadURL(info, time.Now(), baseURLFrom(ctx)), true), nil
 }
 
-func mcpBackupList(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func mcpBackupList(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	all, err := listBackups()
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -464,7 +489,7 @@ func mcpBackupList(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResul
 	now := time.Now()
 	out := make([]*backupInfo, 0, len(all))
 	for _, b := range all {
-		out = append(out, withDownloadURL(b, now))
+		out = append(out, withDownloadURL(b, now, baseURLFrom(ctx)))
 	}
 	return jsonToolResultWithIndent(out, true), nil
 }
