@@ -122,10 +122,37 @@ func davWritable() error {
 		return errDAVReadOnly
 	}
 	davBreaker.mu.Lock()
-	defer davBreaker.mu.Unlock()
-	if davBreaker.tripped {
+	tripped := davBreaker.tripped
+	davBreaker.mu.Unlock()
+	if tripped {
 		return webdav.NewHTTPError(http.StatusServiceUnavailable,
 			fmt.Errorf("CalDAV writes paused after a burst of deletes; POST /api/dav/resume to re-enable"))
+	}
+	// Check the store before touching Things, so a write never lands in
+	// Things without its merge base, alias or sidecar.
+	if err := davDB.writable(); err != nil {
+		return davStoreError(err)
+	}
+	return nil
+}
+
+// davStoreError turns a store outage into a 503 the client retries later.
+func davStoreError(err error) error {
+	if isStoreUnavailable(err) {
+		return webdav.NewHTTPError(http.StatusServiceUnavailable,
+			fmt.Errorf("CalDAV edits are briefly unavailable (the shared store has no leader); try again shortly: %v", err))
+	}
+	return err
+}
+
+// davFreshState syncs from Things Cloud before a merge, bypassing the read
+// throttle: another node may have written moments ago, and merging against
+// stale Things state would undo its change. The view cache keys on the
+// synced index, so the next loadDAVView renders the fresh state.
+func davFreshState() error {
+	if err := forceSync(); err != nil {
+		return webdav.NewHTTPError(http.StatusServiceUnavailable,
+			fmt.Errorf("couldn't refresh from Things Cloud before applying the edit; try again shortly: %v", err))
 	}
 	return nil
 }
@@ -185,6 +212,9 @@ func (davBackend) PutCalendarObject(ctx context.Context, p string, cal *ical.Cal
 	}
 	davWriteMu.Lock()
 	defer davWriteMu.Unlock()
+	if err := davFreshState(); err != nil {
+		return nil, err
+	}
 
 	view, err := loadDAVView()
 	if err != nil {
@@ -223,7 +253,7 @@ func (davBackend) PutCalendarObject(ctx context.Context, p string, cal *ical.Cal
 		if isInvalidInput(err) {
 			return nil, davBadRequest("%v", err)
 		}
-		return nil, err
+		return nil, davStoreError(err)
 	}
 	// No ETag: the stored object differs from what the client sent (it is
 	// re-rendered from Things), so the client must re-fetch it (RFC 4791 §5.3.4).
@@ -243,6 +273,9 @@ func (davBackend) DeleteCalendarObject(ctx context.Context, p string) error {
 	}
 	davWriteMu.Lock()
 	defer davWriteMu.Unlock()
+	if err := davFreshState(); err != nil {
+		return err
+	}
 
 	view, err := loadDAVView()
 	if err != nil {

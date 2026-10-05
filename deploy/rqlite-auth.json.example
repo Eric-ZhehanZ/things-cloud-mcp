@@ -1,0 +1,4 @@
+[
+  {"username": "things", "password": "REPLACE_WITH_DAV_RQLITE_PASSWORD", "perms": ["all"]},
+  {"username": "*", "perms": ["ready", "status"]}
+]

@@ -4,7 +4,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -49,10 +48,7 @@ func newFakeDAV(t *testing.T) *fakeDAV {
 	t.Setenv("THINGS_TIMEZONE", "America/New_York")
 	t.Setenv("CALDAV_READ_ONLY", "")
 
-	store, err := openDAVStore(filepath.Join(t.TempDir(), "dav.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := newTestDAVStore(t)
 	origDB, origState, origView, origWrite, origSync := davDB, davState, loadDAVView, writeToHistory, doSync
 	davDB = store
 	davState = func() davTaskSource { return f }
@@ -208,9 +204,8 @@ func TestDAVPutConflictThingsWins(t *testing.T) {
 	if len(f.writes) != 0 {
 		t.Errorf("conflicting title must not be written: %+v", f.writes)
 	}
-	var n int
-	davDB.db.QueryRow(`SELECT COUNT(*) FROM write_log WHERE detail LIKE '%"field":"title"%'`).Scan(&n)
-	if n != 1 {
+	rows, _ := davDB.sql.query(false, stmt("", `SELECT COUNT(*) FROM write_log WHERE detail LIKE '%"field":"title"%'`))
+	if len(rows) != 1 || sqlInt(rows[0][0]) != 1 {
 		t.Errorf("conflict not logged")
 	}
 }

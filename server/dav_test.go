@@ -54,6 +54,7 @@ func stubDAV(t *testing.T) *httptest.Server {
 	mux := http.NewServeMux()
 	h := newDAVHandler()
 	mux.Handle(davPrefix+"/", h)
+	mux.Handle(davPrefix, h) // go-webdav's client asks "/dav" without the slash
 	mux.Handle("/.well-known/caldav", h)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)

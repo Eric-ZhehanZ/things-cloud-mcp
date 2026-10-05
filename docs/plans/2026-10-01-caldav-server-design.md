@@ -377,3 +377,22 @@ write_log(at, uid, fields, conflicts_json)
    (`CALDAV_COMPLETED_DAYS=0` exposes everything).
 5. **Canceled tasks:** sent as `CANCELLED`, which BusyCal hides. They exist
    only in the Things Logbook.
+
+## Addendum (2026-10-05): multi-node deployment
+
+The server now runs on several self-hosted nodes behind one Cloudflare Tunnel
+(see `deploy/README.md`). What changed for CalDAV:
+
+- The store (`server/dav_store.go`) runs its SQL on a backend: local SQLite
+  (default), rqlite (`DAV_RQLITE_URL`) so merge bases, aliases, sidecars and
+  recent deletes are shared by every node, or rqlite with a local fallback
+  copy and replay journal (`dav_store_failover.go`) so a node without an
+  rqlite leader (Romania with every US node down) keeps accepting edits.
+- `recordServed` is one batched request (rqlite has no interactive
+  transactions); `takeRecentDelete` claims its row with a conditional delete
+  and checks rows affected; `snapshot` and `takeRecentDelete` use
+  linearizable reads.
+- A `meta.generation` counter, bumped with every alias/sidecar write, is part
+  of the render cache key so other nodes notice those changes.
+- Every PUT/DELETE force-syncs Things before merging (`davFreshState`), since
+  another node may have written moments ago.

@@ -1,0 +1,61 @@
+# One node of the self-hosted things-cloud-mcp cluster. The same file runs on
+# every server (US1-3 and Romania); everything node-specific is in .env.
+# See README.md for setup, cutover and failover drills.
+
+name: things
+
+services:
+  app:
+    image: ${APP_IMAGE:-things-cloud-mcp:local}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      THINGS_DB_PATH: /data/things.db
+    volumes:
+      - ./data:/data
+    # No published ports: traffic arrives only through cloudflared.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      # A fresh node replays the whole Things history before it is healthy.
+      start_period: 10m
+
+  rqlite:
+    image: rqlite/rqlite:${RQLITE_VERSION:-9.4.5}
+    restart: unless-stopped
+    # Host networking, bound to the private mesh address only: rqlite is
+    # never reachable from the public internet.
+    network_mode: host
+    environment:
+      NODE_ID: ${NODE_NAME}
+      HTTP_ADDR: ${MESH_IP}:4001
+      HTTP_ADV_ADDR: ${MESH_IP}:4001
+      RAFT_ADDR: ${MESH_IP}:4002
+      RAFT_ADV_ADDR: ${MESH_IP}:4002
+    command:
+      - -auth=/rqlite/auth.json
+      - -join-as=things
+      - -join=${RQLITE_JOIN}
+      - -join-attempts=200
+      - -join-interval=5s
+      # Voters: -bootstrap-expect=3. Romania: -raft-non-voter=true.
+      - ${RQLITE_ROLE_FLAG}
+    volumes:
+      - ./rqlite:/rqlite/file
+      - ./rqlite-auth.json:/rqlite/auth.json:ro
+
+  cloudflared:
+    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-latest}
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    # A node only joins the tunnel once its app answers /healthz.
+    depends_on:
+      app:
+        condition: service_healthy

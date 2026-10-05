@@ -406,6 +406,10 @@ func main() {
 		log.Fatal("THINGS_USERNAME and THINGS_PASSWORD must be set")
 	}
 
+	if node := nodeName(); node != "" {
+		log.SetPrefix("[" + node + "] ")
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -426,11 +430,12 @@ func main() {
 	}
 	defer syncer.Close()
 
-	davDB, err = openDAVStore(davStorePath(dbPath))
+	davDB, err = openConfiguredDAVStore(davStorePath(dbPath))
 	if err != nil {
 		log.Fatalf("failed to open CalDAV store: %v", err)
 	}
 	defer davDB.Close()
+	log.Printf("CalDAV store: %s", davDB.mode())
 
 	if err := runInitialSync(syncer); err != nil {
 		log.Fatal(err)
@@ -445,6 +450,7 @@ func main() {
 		log.Fatalf("failed to sync history: %v", err)
 	}
 	log.Println("History ready for writes")
+	serverReady.Store(true)
 
 	dav := newDAVHandler()
 
@@ -462,6 +468,8 @@ func main() {
 		jsonResponse(w, map[string]string{"service": "things-cloud-api", "status": "ok"})
 	})
 
+	http.HandleFunc("/healthz", handleHealthz)
+	http.HandleFunc("/api/dav/store", authMiddleware(handleDAVStoreStatus))
 	http.HandleFunc("/api/verify", authMiddleware(handleVerify))
 	http.HandleFunc("/api/sync", authMiddleware(handleSync))
 	http.HandleFunc("/api/tasks/inbox", authMiddleware(handleInbox))
@@ -632,6 +640,9 @@ func main() {
 	// CalDAV endpoint — Basic auth with CALDAV_PASSWORD (falls back to API_KEY)
 	if dav != nil {
 		http.Handle(davPrefix+"/", dav)
+		// Without this, ServeMux answers PROPFIND /dav with a redirect that
+		// clients follow as a GET.
+		http.Handle(davPrefix, dav)
 		http.Handle("/.well-known/caldav", dav)
 		http.HandleFunc("/api/dav/resume", authMiddleware(handleDAVResume))
 		mode := "read-write"
