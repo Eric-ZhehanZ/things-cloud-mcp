@@ -102,4 +102,7 @@ The example app and real usage require:
 - `THINGS_TIMEZONE` — Fallback IANA timezone for resolving calendar days (`when: "today"`, deadline validation, repeat anchors) when a request does not carry its own `timezone` parameter (default: UTC)
 - `SYNC_MIN_INTERVAL` — Minimum seconds between on-demand syncs against Things Cloud (default: `2`); post-write refreshes bypass the throttle
 - `PORT` — Server port (default: `8080`)
+- `NODE_NAME` — Which server this is (log prefix, `/healthz`, backup manifests); used by the self-hosted cluster in `deploy/`
+- `DAV_RQLITE_URL` — rqlite node for the shared CalDAV store (e.g. `http://10.77.0.1:4001`, credentials via `DAV_RQLITE_USER`/`DAV_RQLITE_PASSWORD` or in the URL); unset = local SQLite at `DAV_DB_PATH`. `DAV_LOCAL_FALLBACK=false` disables the no-leader fallback (`server/dav_store_failover.go`)
+- `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` (`R2_PREFIX`, default `backups/`) — store backups in an S3-compatible bucket instead of `BACKUP_DIR`
 - `DEBUG` — Enable verbose HTTP request/response logging when `true`

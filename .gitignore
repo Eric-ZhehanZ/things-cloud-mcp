@@ -38,3 +38,8 @@ tests/test-results.log
 
 # CalDAV spike captures (may contain personal task data)
 caldav-captures/
+
+# Self-hosted deployment state (deploy/README.md)
+deploy/data/
+deploy/rqlite/
+deploy/rqlite-auth.json

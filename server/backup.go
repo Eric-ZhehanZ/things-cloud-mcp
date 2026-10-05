@@ -1,16 +1,19 @@
 package main
 
-// Database backups on the persistent volume:
+// Database backups:
 //
-//   - manual:  a consistent snapshot of the live Things mirror and CalDAV
-//              store, taken on demand (things_backup_create)
+//   - manual:  a consistent snapshot of the Things mirror (this node's) and
+//              the CalDAV store, taken on demand (things_backup_create)
 //   - rebuild: Things as it stood at a past moment, rebuilt by replaying
 //              Things Cloud history up to then (things_backup_create as_of)
-//   - auto:    a scheduled snapshot every BACKUP_INTERVAL_HOURS (default 24)
+//   - auto:    a scheduled snapshot every BACKUP_INTERVAL_HOURS (default 24),
+//              taken by one node at a time under a lease in the CalDAV store
 //
-// Each backup is a zip of plain SQLite files plus manifest.json, stored in
-// BACKUP_DIR (default <data dir>/backups) and pruned per kind. Downloads use
-// short-lived signed links so tool output never carries the API key.
+// Each backup is a zip of plain SQLite files plus manifest.json, stored in an
+// R2 bucket shared by all nodes when R2_* is set, else in BACKUP_DIR
+// (default <data dir>/backups), and pruned per kind (backup_storage.go).
+// Downloads use short-lived signed links, keyed off API_KEY so any node can
+// serve any link, so tool output never carries the API key.
 
 import (
 	"archive/zip"
@@ -20,6 +23,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -71,6 +75,7 @@ type backupInfo struct {
 	HistoryItems int        `json:"history_items,omitempty"`
 	HistoryStart *time.Time `json:"history_starts_at,omitempty"`
 	Note         string     `json:"note,omitempty"`
+	Node         string     `json:"node,omitempty"`
 	DownloadURL  string     `json:"download_url,omitempty"`
 	URLExpiresAt *time.Time `json:"download_url_expires_at,omitempty"`
 }
@@ -88,20 +93,22 @@ func createBackup(kind string, asOf *time.Time) (*backupInfo, error) {
 	backupMu.Lock()
 	defer backupMu.Unlock()
 
-	dir := backupDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	store, err := currentBackupStorage()
+	if err != nil {
 		return nil, err
 	}
-	tmp, err := os.MkdirTemp(dir, ".tmp-")
+	tmp, err := backupTempDir(store)
 	if err != nil {
 		return nil, err
 	}
 	defer os.RemoveAll(tmp)
 
 	now := backupNow().UTC().Truncate(time.Second)
-	info := &backupInfo{Kind: kind, CreatedAt: now, AsOf: now}
+	info := &backupInfo{Kind: kind, CreatedAt: now, AsOf: now, Node: nodeName()}
 	info.ID = fmt.Sprintf("things-%s-%s.zip", kind, now.Format("20060102T150405Z"))
-	if _, err := os.Stat(filepath.Join(dir, info.ID)); err == nil {
+	if taken, err := store.exists(info.ID); err != nil {
+		return nil, fmt.Errorf("check backup storage: %w", err)
+	} else if taken {
 		return nil, fmt.Errorf("a %s backup was just taken; try again in a second", kind)
 	}
 
@@ -140,18 +147,40 @@ func createBackup(kind string, asOf *time.Time) (*backupInfo, error) {
 		}
 	}
 
-	path := filepath.Join(dir, info.ID)
+	path := filepath.Join(tmp, info.ID)
 	if err := writeBackupZip(path, files, info); err != nil {
-		os.Remove(path)
 		return nil, err
 	}
-	if err := finishBackupInfo(path, info); err != nil {
+	index, err := finishBackupInfo(path, info)
+	if err != nil {
 		return nil, err
+	}
+	// The zip first, then its index: listings only show complete backups.
+	if err := store.put(info.ID, path); err != nil {
+		return nil, fmt.Errorf("store %s: %w", info.ID, err)
+	}
+	if err := store.put(backupIndexName(info.ID), index); err != nil {
+		store.remove(info.ID)
+		return nil, fmt.Errorf("store %s: %w", backupIndexName(info.ID), err)
 	}
 	pruneBackups(kind)
-	log.Printf("[BACKUP] %s: %s (%d bytes)", kind, info.ID, info.SizeBytes)
+	log.Printf("[BACKUP] %s: %s (%d bytes) in %s", kind, info.ID, info.SizeBytes, store)
 	return info, nil
 }
+
+// backupTempDir is where a backup is assembled: inside the backup directory
+// for local storage (so the final move is a rename), else the system temp.
+func backupTempDir(store backupStorage) (string, error) {
+	if l, ok := store.(localBackupStorage); ok {
+		if err := os.MkdirAll(l.dir, 0o700); err != nil {
+			return "", err
+		}
+		return os.MkdirTemp(l.dir, ".tmp-")
+	}
+	return os.MkdirTemp("", "things-backup-")
+}
+
+func backupIndexName(id string) string { return strings.TrimSuffix(id, ".zip") + ".json" }
 
 func writeBackupZip(path string, files map[string]string, info *backupInfo) error {
 	out, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -196,38 +225,37 @@ func writeBackupZip(path string, files map[string]string, info *backupInfo) erro
 }
 
 // finishBackupInfo records the archive's size and hash in a JSON index file
-// next to it.
-func finishBackupInfo(path string, info *backupInfo) error {
+// next to it and returns that file's path.
+func finishBackupInfo(path string, info *backupInfo) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer f.Close()
 	h := sha256.New()
 	n, err := io.Copy(h, f)
 	if err != nil {
-		return err
+		return "", err
 	}
 	info.SizeBytes, info.SHA256 = n, hex.EncodeToString(h.Sum(nil))
 	b, _ := json.MarshalIndent(info, "", "  ")
-	return os.WriteFile(strings.TrimSuffix(path, ".zip")+".json", b, 0o600)
+	index := strings.TrimSuffix(path, ".zip") + ".json"
+	return index, os.WriteFile(index, b, 0o600)
 }
 
 // listBackups returns backups newest first.
 func listBackups() ([]*backupInfo, error) {
-	entries, err := os.ReadDir(backupDir())
-	if os.IsNotExist(err) {
-		return nil, nil
+	store, err := currentBackupStorage()
+	if err != nil {
+		return nil, err
 	}
+	names, err := store.list(".json")
 	if err != nil {
 		return nil, err
 	}
 	var out []*backupInfo
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(backupDir(), e.Name()))
+	for _, name := range names {
+		b, err := store.read(name)
 		if err != nil {
 			continue
 		}
@@ -255,9 +283,16 @@ func pruneBackups(kind string) {
 		if kept <= backupKeep[kind] {
 			continue
 		}
-		base := filepath.Join(backupDir(), strings.TrimSuffix(b.ID, ".zip"))
-		os.Remove(base + ".zip")
-		os.Remove(base + ".json")
+		store, err := currentBackupStorage()
+		if err != nil {
+			return
+		}
+		// Index first, so a half-pruned backup never lists.
+		if err := store.remove(backupIndexName(b.ID)); err != nil {
+			log.Printf("[BACKUP] prune %s: %v", b.ID, err)
+			continue
+		}
+		store.remove(b.ID)
 		log.Printf("[BACKUP] pruned %s", b.ID)
 	}
 }
@@ -279,8 +314,8 @@ func backupInterval() time.Duration {
 }
 
 // autoBackupDue reports whether the newest automatic backup is older than
-// the interval. Fly stops idle machines, so this is checked on start and
-// hourly rather than trusting one long timer.
+// the interval. Nodes restart, so this is checked on start and hourly
+// rather than trusting one long timer.
 func autoBackupDue(now time.Time, interval time.Duration) bool {
 	all, err := listBackups()
 	if err != nil {
@@ -294,21 +329,55 @@ func autoBackupDue(now time.Time, interval time.Duration) bool {
 	return true
 }
 
+// autoBackupLeaseTTL bounds how long a node that died mid-backup blocks the
+// others.
+const autoBackupLeaseTTL = 30 * time.Minute
+
+// runAutoBackup takes the automatic backup when it is due and this node wins
+// the "auto-backup" lease, so only one node takes each snapshot. Without a
+// shared store the lease is local and always won.
+func runAutoBackup(now time.Time, interval time.Duration) bool {
+	if !autoBackupDue(now, interval) {
+		return false
+	}
+	if davDB != nil {
+		holder := nodeName()
+		if holder == "" {
+			holder, _ = os.Hostname()
+		}
+		won, err := davDB.acquireLease("auto-backup", holder, now, autoBackupLeaseTTL)
+		if err != nil {
+			log.Printf("[BACKUP] automatic backup skipped: lease: %v", err)
+			return false
+		}
+		if !won {
+			return false
+		}
+		// Another node may have finished one between the check and the lease.
+		if !autoBackupDue(now, interval) {
+			return false
+		}
+	}
+	if _, err := createBackup(backupKindAuto, nil); err != nil {
+		log.Printf("[BACKUP] automatic backup failed: %v", err)
+		return false
+	}
+	return true
+}
+
 func startBackupScheduler(ctx context.Context) {
 	interval := backupInterval()
 	if interval == 0 {
 		log.Printf("[BACKUP] automatic backups disabled (BACKUP_INTERVAL_HOURS=0)")
 		return
 	}
-	log.Printf("[BACKUP] automatic backups every %s into %s", interval, backupDir())
+	where := backupDir()
+	if store, err := currentBackupStorage(); err == nil {
+		where = store.String()
+	}
+	log.Printf("[BACKUP] automatic backups every %s into %s", interval, where)
 	go func() {
-		check := func() {
-			if autoBackupDue(time.Now(), interval) {
-				if _, err := createBackup(backupKindAuto, nil); err != nil {
-					log.Printf("[BACKUP] automatic backup failed: %v", err)
-				}
-			}
-		}
+		check := func() { runAutoBackup(time.Now(), interval) }
 		check()
 		t := time.NewTicker(time.Hour)
 		defer t.Stop()
@@ -421,21 +490,26 @@ func handleBackupDownload(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "link expired or invalid; create a fresh one with things_backup_list", http.StatusUnauthorized)
 		return
 	}
-	path := filepath.Join(backupDir(), id)
-	f, err := os.Open(path)
-	if err != nil {
-		jsonError(w, "unknown backup", http.StatusNotFound)
-		return
-	}
-	defer f.Close()
-	st, err := f.Stat()
+	store, err := currentBackupStorage()
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Streamed through this server, so the link stays on the request's
+	// own domain.
+	f, modTime, err := store.open(id)
+	if errors.Is(err, errBackupNotFound) {
+		jsonError(w, "unknown backup", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer f.Close()
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+id+`"`)
-	http.ServeContent(w, r, id, st.ModTime(), f)
+	http.ServeContent(w, r, id, modTime, f)
 }
 
 // ---------------------------------------------------------------------------

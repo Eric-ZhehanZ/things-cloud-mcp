@@ -278,13 +278,20 @@ func syncForRead() error {
 // throttle so the write is immediately visible to reads.
 // Errors are logged but not returned (best-effort refresh).
 func syncAfterWrite() {
+	if err := forceSync(); err != nil {
+		log.Printf("[SYNC] post-write refresh failed: %v", err)
+	}
+}
+
+// forceSync syncs now, bypassing the throttle.
+func forceSync() error {
 	syncThrottleMu.Lock()
 	defer syncThrottleMu.Unlock()
 	if err := doSync(); err != nil {
-		log.Printf("[SYNC] post-write refresh failed: %v", err)
-		return
+		return err
 	}
 	lastSyncAt = time.Now()
+	return nil
 }
 
 // ---------------------------------------------------------------------------
