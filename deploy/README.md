@@ -11,7 +11,7 @@ Four nodes run the same `docker-compose.yml`; only `.env` differs.
 - **Things mirror** (`data/things.db`): local per node, rebuilt from Things Cloud on first start.
 - **CalDAV store** (merge bases, aliases, sidecars, recent deletes, write log): shared in rqlite.
 - **Backups:** an R2 bucket shared by all nodes. One node takes each daily backup (a lease row in rqlite).
-- **Health:** `GET /healthz` (no auth) is 200 once the initial Things sync is done. cloudflared on a node starts only after its app is healthy.
+- **Health:** `GET /healthz` (no auth) is 200 once the initial Things sync is done. Cloudflare Tunnel doesn't check origins, so cloudflared runs behind a guard (`tunnel/guard.sh`) that polls the app every 2 s: it connects only once the app is healthy and disconnects after two failed checks in a row, so a dead, hung or restarting app hands its traffic to the other nodes within seconds.
 
 ## Failure behaviour
 
@@ -47,7 +47,8 @@ cd /opt/things-cloud-mcp && git checkout <commit>
 cd deploy
 cp .env.example .env                       # owner fills in the SECRET lines
 cp rqlite-auth.json.example rqlite-auth.json   # owner sets the password (= DAV_RQLITE_PASSWORD)
-mkdir -p data rqlite && sudo chown 1000:1000 rqlite   # the rqlite image runs as uid 1000
+mkdir -p data rqlite
+sudo chown 1000:1000 rqlite rqlite-auth.json   # the rqlite image runs as uid 1000 and must read the auth file
 chmod 600 .env rqlite-auth.json
 ```
 
@@ -55,17 +56,17 @@ Per node, set `NODE_NAME`, `MESH_IP`, `DAV_RQLITE_URL=http://<MESH_IP>:4001` and
 
 ### Image
 
-Either build on the node (`docker compose build app`), build once and copy (`docker save things-cloud-mcp:local | ssh <node> docker load`), or pull from GHCR: `.github/workflows/image.yml` publishes `ghcr.io/zhehanzhang/things-cloud-mcp:<branch>` and `:sha-<commit>` on every push. A private package needs `docker login ghcr.io` on each node with a read-only token; then set `APP_IMAGE` in `.env`.
+Two images: the app and the cloudflared guard (`things-tunnel:local`, from `tunnel/`). Either build on the node (`docker compose build`), build once and copy (`docker save things-cloud-mcp:local things-tunnel:local | ssh <node> docker load`), or pull from GHCR: `.github/workflows/image.yml` publishes `ghcr.io/zhehanzhang/things-cloud-mcp:<branch>` and `:sha-<commit>` on every push. A private package needs `docker login ghcr.io` on each node with a read-only token; then set `APP_IMAGE` in `.env` and still build the guard (`docker compose build cloudflared`).
 
 ## Cutover from Fly (don't skip steps)
 
 1. **rqlite.** On us1, us2, us3: `docker compose up -d rqlite`. Check a leader exists: `curl -s http://<MESH_IP>:4001/readyz` → `leader ok`, and `curl -s -u things:<pw> http://<MESH_IP>:4001/nodes?nonvoters` lists 3 voters. Then on ro: `docker compose up -d rqlite`; `/nodes?nonvoters` now shows ro with `"voter":false`.
 2. **Apps, read-only.** With `CALDAV_READ_ONLY=true` in every `.env`: `docker compose up -d` on all four nodes. Wait for `docker compose ps` to show `app` healthy (the first sync can take minutes). In the Cloudflare dashboard, add a public hostname on the tunnel, e.g. `test.thingsapi.com → http://app:8080`. Verify through it: MCP reads (`/mcp?key=…`), CalDAV listing with colors and CTag (`PROPFIND /dav/me/calendars/` with Depth 1), `/healthz` on every node (`docker compose exec app wget -qO- 127.0.0.1:8080/healthz`), and backup list/download.
-3. **Migrate the CalDAV store** while BusyCal is idle (quit it on Mac and iPhone), then go straight to step 4. On us1: `./migrate-dav-store.sh https://things-cloud-mcp-glowing-hill-8460.fly.dev`. It takes a consistent backup on Fly over MCP, loads its `things-dav.db` into rqlite and checks all five tables' row counts match. Stop if it reports a mismatch.
+3. **Migrate the CalDAV store** while BusyCal is idle (quit it on Mac and iPhone), then go straight to step 4. On us1: `./migrate-dav-store.sh https://things-cloud-mcp-glowing-hill-8460.fly.dev`. It takes a consistent backup on Fly over MCP, loads its `things-dav.db` into rqlite and checks all five tables' row counts match. Stop if it reports a mismatch. Needs `curl`, `unzip` and `python3` on the node (`apt install unzip` if missing).
 4. **CalDAV.** Set `CALDAV_READ_ONLY=false` on all nodes and `docker compose up -d app`. Point `cal.thingsapi.com` at the tunnel (public hostname → `http://app:8080`; remove the old DNS record). Test from BusyCal: rename, date, alert, tag, complete/reopen, create in a project, move between lists, delete (lands in Things Trash), drag and delete a Deadlines event.
 5. **MCP.** Point `ai.thingsapi.com` and `thingsmcp.zheha.nz` at the tunnel. Verify MCP from claude.ai and that `things_backup_create` returns a link on `ai.thingsapi.com` that downloads.
 6. **Failover drills.**
-   - `docker compose stop app` on one US node: no visible change. Start it again.
+   - `docker compose stop app` on one US node, including the one nearest you (it gets your traffic): at most a few seconds of 502s while its guard disconnects, then the other nodes serve. The guard's log (`docker compose logs cloudflared`) shows `stopping cloudflared`. Start it again; the guard reconnects once the app is healthy.
    - `docker compose stop rqlite` on one US node: edits still work. Start it again.
    - Stop cloudflared (or everything) on all three US nodes: Romania serves, MCP and BusyCal edits keep working (`/healthz` on ro shows `local-fallback`). Start the US nodes: ro's log shows `replayed N journaled writes`, and `/api/dav/store` on a US node shows the edits.
 7. **Rollback window.** Keep the Fly app running and idle for one week; rollback is pointing the three hostnames back at Fly. Then take a final backup and `fly apps destroy things-cloud-mcp-glowing-hill-8460` (this deletes the volume and its snapshots).

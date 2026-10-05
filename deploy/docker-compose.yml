@@ -50,12 +50,16 @@ services:
       - ./rqlite-auth.json:/rqlite/auth.json:ro
 
   cloudflared:
-    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-latest}
+    # cloudflared behind a guard: connected only while this node's app
+    # answers /healthz, so a dead, hung or restarting app takes its tunnel
+    # connections with it and Cloudflare routes to the other nodes.
+    image: ${TUNNEL_IMAGE:-things-tunnel:local}
+    build:
+      context: tunnel
+      args:
+        CLOUDFLARED_VERSION: ${CLOUDFLARED_VERSION:-latest}
     restart: unless-stopped
-    command: tunnel --no-autoupdate run
     environment:
       TUNNEL_TOKEN: ${TUNNEL_TOKEN}
-    # A node only joins the tunnel once its app answers /healthz.
     depends_on:
-      app:
-        condition: service_healthy
+      - app
